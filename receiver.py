@@ -3,22 +3,9 @@ from pydantic import BaseModel
 from typing import Any, Dict
 import json
 import threading
-import sys
-import pathlib
 import os
+from Comms.src.kmw import PyKafBridge
 
-# Attempt to import PyKafBridge from kmw.py in the Comms module, to prevent errors
-try:
-    from kmw import PyKafBridge
-except Exception:
-    PyKafBridge = None
-    candidate = pathlib.Path(__file__).resolve().parents[0] / "Comms" / "src"
-    if candidate.exists():
-        sys.path.insert(0, str(candidate))
-        try:
-            from kmw import PyKafBridge
-        except Exception:
-            PyKafBridge = None
 
 # Kafka setup
 KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
