@@ -1,35 +1,42 @@
 from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Any, Dict
+from contextlib import asynccontextmanager
 import json
-import threading
 import os
-from Comms.src.kmw import PyKafBridge
-
+from utils.kmw import PyKafBridge
 
 # Kafka setup
 KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
 KAFKA_PORT = os.getenv("KAFKA_PORT", "9092")
-TOPIC = os.getenv("KAFKA_TOPIC", "raw-data")
+TOPIC      = os.getenv("KAFKA_TOPIC", "raw-data")
 
-if PyKafBridge is not None:
+
+kafka_bridge = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+
+    # Startup: Start Kafka bridge
+    global kafka_bridge
     try:
-        kafka_bridge = PyKafBridge(KAFKA_HOST, KAFKA_PORT, TOPIC)
-    except Exception:
+        kafka_bridge = PyKafBridge(TOPIC, hostname=KAFKA_HOST, port=KAFKA_PORT)
+
+        await kafka_bridge.start()
+        print("Kafka bridge started")
+    except Exception as e:
+        print(f"Failed to start Kafka bridge: {e}")
         kafka_bridge = None
-else:
-    kafka_bridge = None
 
+    yield
 
-def start_kafka():
+    # Shutdown: Stop Kafka bridge
     if kafka_bridge is not None:
-        try:
-            kafka_bridge.start()
-        except Exception:
-            pass
+        await kafka_bridge.stop()
 
 # Initialize FastAPI app
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 # Can be expanded later
 class DataPacket(BaseModel):
@@ -95,7 +102,7 @@ async def receive_data(request: Request):
                 results.append({"status": "ok", "data": filtered})
             else:
                 results.append({"status": "error", "message": "Failed to send to Kafka", "data": filtered})
-        
+
         print(results)
 
         return {"results": results}
@@ -118,19 +125,3 @@ async def receive_data(request: Request):
         return {"status": "ok", "data": filtered}
     else:
         return {"status": "error", "message": "Failed to send to Kafka"}
-
-# Start Kafka bridge in a separate thread on startup
-@app.on_event("startup")
-def startup_event():
-    threading.Thread(target=start_kafka, daemon=True).start()
-    print("Kafka bridge started")
-
-# Stop Kafka bridge on shutdown
-@app.on_event("shutdown")
-def shutdown_event():
-    if kafka_bridge is not None:
-        try:
-            kafka_bridge.stop()
-        except Exception:
-            pass
-        print("Kafka bridge stopped")
