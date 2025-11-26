@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from typing import Any, Dict
 import json
@@ -31,6 +31,7 @@ def start_kafka():
 # Initialize FastAPI app
 app = FastAPI()
 
+# Can be expanded later
 class DataPacket(BaseModel):
     data: Dict[str, Any]
 
@@ -51,18 +52,56 @@ REQUIRED_FIELDS = [
 ]
 
 @app.post("/receive")
-async def receive_data(packet: DataPacket):
+async def receive_data(request: Request):
     """Receive a data packet (dict) and return only the required fields.
 
     For any REQUIRED_FIELDS key missing from the incoming packet, the
     returned value will be None.
     """
-    #print("Received:", packet.data)    
+    payload = await request.json()
+    data = payload or {}
 
-    # Keep only keys in REQUIRED_FIELDS, default to None
-    filtered = {k: packet.data.get(k) for k in REQUIRED_FIELDS}
+    print("Received:", data)
+    results = []
 
-    # Convert to JSON string to send to Kafka
+    # Producer sends a batch under analyticsData where each element contains analyticsMetadata with the measurements
+    if isinstance(data, dict) and "analyticsData" in data:
+        analytics_list = data.get("analyticsData") or []
+        for entry in analytics_list:
+            meta = entry.get("analyticsMetadata", {}) if isinstance(entry, dict) else {}
+
+            #ts = meta.get("timestamp") if meta.get("timestamp") is not None else entry.get("timestamp")
+
+            filtered = {}
+            for field in REQUIRED_FIELDS:
+                if field == "timestamp":
+                    filtered[field] = entry.get("timestamp")
+                else:
+                    filtered[field] = meta.get(field)
+
+            message = json.dumps(filtered)
+
+            if kafka_bridge is None:
+                print("Kafka bridge not available - skipping produce (batch entry)")
+                results.append({"status": "no-kafka", "data": filtered})
+                continue
+
+            try:
+                ok = kafka_bridge.produce(TOPIC, message)
+            except Exception:
+                ok = False
+
+            if ok:
+                results.append({"status": "ok", "data": filtered})
+            else:
+                results.append({"status": "error", "message": "Failed to send to Kafka", "data": filtered})
+        
+        print(results)
+
+        return {"results": results}
+
+    # Fallback
+    filtered = {k: data.get(k) for k in REQUIRED_FIELDS}
     message = json.dumps(filtered)
 
     # Send to Kafka if available
