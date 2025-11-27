@@ -1,0 +1,6 @@
+fastapi==0.121.3
+python-dotenv==1.2.1
+uvicorn==0.34.0
+kafka-python==2.0.2
+bandit==1.8.0
+safety==2.3.5
