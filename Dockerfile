@@ -1,21 +1,36 @@
-FROM python:3.11-slim
-
+FROM ghcr.io/astral-sh/uv:python3.11-alpine
 WORKDIR /app
 
-COPY requirements.txt .
-
-RUN apt-get update && apt-get install -y \
+# Install system dependencies (Alpine uses apk, not apt-get)
+RUN apk add --no-cache \
     git \
     wget \
     unzip \
-    && rm -rf /var/lib/apt/lists/*
+    gcc \
+    g++ \
+    make \
+    musl-dev \
+    python3-dev \
+    linux-headers
 
-RUN pip install --no-cache-dir -r requirements.txt
-RUN wget https://github.com/ATNoG/pei-nwdaf-comms/archive/refs/heads/main.zip -O repo.zip && \
-    unzip repo.zip "pei-nwdaf-comms-main/kafka/src/*" -d /tmp && \
-    mkdir -p /app/utils && \
-    mv /tmp/pei-nwdaf-comms-main/kafka/src/* /app/utils/ && \
-    rm -rf repo.zip /tmp/pei-nwdaf-comms-main
+# Download and extract the repository files
+RUN mkdir utils && cd utils \
+&& git init \
+&& git remote add origin https://github.com/ATNoG/pei-nwdaf-comms.git \
+&& git fetch \
+&& git checkout origin/main kafka/src/kmw.py \
+&& mv kafka/src/kmw.py . \
+&& rm -rf .git \
+&& rmdir -p kafka/src
+
+
+# Copy dependency files
+COPY pyproject.toml ./
+
+# Install dependencies using uv
+RUN uv lock
+RUN uv sync --frozen --no-dev --no-install-project
+
 COPY receiver.py .
 
-CMD ["uvicorn", "receiver:app", "--host", "0.0.0.0", "--port", "7000"]
+CMD ["uv","run","uvicorn", "receiver:app", "--host", "0.0.0.0", "--port", "7000"]
