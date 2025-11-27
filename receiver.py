@@ -55,7 +55,11 @@ REQUIRED_FIELDS = [
     "cqi",
     "cell_index",
     "primary_bandwidth",
-    "ul_bandwidth"
+    "ul_bandwidth",
+    "latitude",
+    "longitude",
+    "altitude",
+    "velocity",
 ]
 
 @app.post("/receive")
