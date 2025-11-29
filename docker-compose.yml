@@ -1,0 +1,17 @@
+services:
+  data-ingestion:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7000:7000"
+    environment:
+      - KAFKA_HOST=kafka
+      - KAFKA_PORT=${KAFKA_PORT}
+      - KAFKA_TOPIC=raw-data
+    networks:
+      - nwdaf-network
+
+networks:
+  nwdaf-network:
+    external: true
