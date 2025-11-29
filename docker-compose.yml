@@ -1,5 +1,6 @@
 services:
   data-ingestion:
+    container_name: data-ingestion
     build:
       context: .
       dockerfile: Dockerfile
