@@ -1,17 +1,15 @@
-FROM ghcr.io/astral-sh/uv:python3.11-alpine
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
 WORKDIR /app
 
-# Install system dependencies (Alpine uses apk, not apt-get)
-RUN apk add --no-cache \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     wget \
     unzip \
-    gcc \
-    g++ \
-    make \
-    musl-dev \
+    build-essential \
     python3-dev \
-    linux-headers
+    librdkafka-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 # Download and extract the repository files
 RUN mkdir utils && cd utils \
