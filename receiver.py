@@ -23,17 +23,17 @@ async def lifespan(app: FastAPI):
     try:
         kafka_bridge = PyKafBridge(TOPIC, hostname=KAFKA_HOST, port=KAFKA_PORT)
 
-        await kafka_bridge.start()
-        print("Kafka bridge started")
+        await kafka_bridge.start_consumer()
+        print("Kafka bridge consumer started")
     except Exception as e:
-        print(f"Failed to start Kafka bridge: {e}")
+        print(f"Failed to start Kafka bridge consumer: {e}")
         kafka_bridge = None
 
     yield
 
     # Shutdown: Stop Kafka bridge
     if kafka_bridge is not None:
-        await kafka_bridge.stop()
+        await kafka_bridge.close()
 
 # Initialize FastAPI app
 app = FastAPI(lifespan=lifespan)
