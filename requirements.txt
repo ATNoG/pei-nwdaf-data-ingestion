@@ -4,3 +4,5 @@ uvicorn==0.34.0
 confluent_kafka==2.12.2
 bandit==1.8.0
 safety==2.3.5
+pytest==8.3.4
+httpx==0.28.1
