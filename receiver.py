@@ -9,7 +9,7 @@ from utils.kmw import PyKafBridge
 # Kafka setup
 KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
 KAFKA_PORT = os.getenv("KAFKA_PORT", "9092")
-TOPIC      = os.getenv("KAFKA_TOPIC", "raw-data")
+TOPIC      = os.getenv("KAFKA_TOPIC","network.data.ingested")
 
 
 kafka_bridge = None

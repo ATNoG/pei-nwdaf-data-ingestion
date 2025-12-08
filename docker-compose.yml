@@ -9,7 +9,7 @@ services:
     environment:
       - KAFKA_HOST=kafka
       - KAFKA_PORT=${KAFKA_PORT}
-      - KAFKA_TOPIC=raw-data
+      - KAFKA_TOPIC=network.data.ingested
     networks:
       - nwdaf-network
 
