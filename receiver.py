@@ -1,10 +1,15 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
-from typing import Any, Dict
+from typing import Any, Dict, Set
 from contextlib import asynccontextmanager
 import json
 import os
+import asyncio
+import logging
 from utils.kmw import PyKafBridge
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Kafka setup
 KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
@@ -13,6 +18,45 @@ TOPIC      = os.getenv("KAFKA_TOPIC","network.data.ingested")
 
 
 kafka_bridge = None
+
+
+# WebSocket connection manager
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Set[WebSocket] = set()
+        self._lock = asyncio.Lock()
+    
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        async with self._lock:
+            self.active_connections.add(websocket)
+        logger.info(f"WebSocket connected. Total connections: {len(self.active_connections)}")
+    
+    async def disconnect(self, websocket: WebSocket):
+        async with self._lock:
+            self.active_connections.discard(websocket)
+        logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
+    
+    async def broadcast(self, message: dict):
+        """Broadcast message to all connected clients"""
+        disconnected = set()
+        
+        async with self._lock:
+            connections = self.active_connections.copy()
+        
+        for connection in connections:
+            try:
+                await connection.send_json(message)
+            except Exception as e:
+                logger.error(f"Error broadcasting to client: {e}")
+                disconnected.add(connection)
+        
+        if disconnected:
+            async with self._lock:
+                self.active_connections -= disconnected
+
+
+manager = ConnectionManager()
 
 
 @asynccontextmanager
@@ -96,6 +140,11 @@ async def receive_data(request: Request):
 
             if ok:
                 results.append({"status": "ok", "data": filtered})
+                # Broadcast to WebSocket clients
+                asyncio.create_task(manager.broadcast({
+                    "type": "data_ingested",
+                    "data": filtered
+                }))
             else:
                 results.append({"status": "error", "message": "Failed to send to Kafka", "data": filtered})
 
@@ -118,6 +167,43 @@ async def receive_data(request: Request):
         success = False
 
     if success:
+        # Broadcast to WebSocket clients
+        asyncio.create_task(manager.broadcast({
+            "type": "data_ingested",
+            "data": filtered
+        }))
         return {"status": "ok", "data": filtered}
     else:
         return {"status": "error", "message": "Failed to send to Kafka"}
+
+
+@app.websocket("/ws/ingestion")
+async def websocket_ingestion(websocket: WebSocket):
+    """
+    WebSocket endpoint for real-time data ingestion updates.
+    
+    Clients connect to this endpoint to receive live updates when data is ingested.
+    
+    Message format:
+    - {"type": "data_ingested", "data": {...}}
+    """
+    await manager.connect(websocket)
+    
+    try:
+        while True:
+            # Keep connection alive and listen for client messages
+            data = await websocket.receive_text()
+            
+            # Handle ping/pong
+            try:
+                message = json.loads(data)
+                if message.get("type") == "ping":
+                    await websocket.send_json({"type": "pong"})
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON received: {data}")
+                
+    except WebSocketDisconnect:
+        await manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        await manager.disconnect(websocket)
