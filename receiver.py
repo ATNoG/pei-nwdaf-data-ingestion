@@ -7,6 +7,7 @@ import os
 import asyncio
 import logging
 from utils.kmw import PyKafBridge
+from collections import deque
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,7 +17,7 @@ KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
 KAFKA_PORT = os.getenv("KAFKA_PORT", "9092")
 TOPIC      = os.getenv("KAFKA_TOPIC","network.data.ingested")
 
-
+raw_data_store = deque(maxlen=1000)  # Store last 1000 entries
 kafka_bridge = None
 
 
@@ -74,6 +75,18 @@ async def lifespan(app: FastAPI):
 # Initialize FastAPI app
 app = FastAPI(lifespan=lifespan)
 
+# CORS middleware
+origins = os.getenv("CORS_ORIGINS", "")
+allowed_origins = [o.strip() for o in origins.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows GET, POST, etc.
+    allow_headers=["*"],  # Allows all headers
+)
+
 # Can be expanded later
 class DataPacket(BaseModel):
     data: Dict[str, Any]
@@ -119,13 +132,16 @@ async def receive_data(request: Request):
 
             #ts = meta.get("timestamp") if meta.get("timestamp") is not None else entry.get("timestamp")
 
+            raw = {}
             filtered = {}
-            for field in REQUIRED_FIELDS:
-                if field == "timestamp":
-                    filtered[field] = entry.get("timestamp")
-                else:
-                    filtered[field] = meta.get(field)
+            raw["timestamp"] = entry.get("timestamp")
+            filtered["timestamp"] = entry.get("timestamp")
+            for field in meta:
+                    if field in REQUIRED_FIELDS:
+                        filtered[field] = meta.get(field)
+                    raw[field] = meta.get(field)
 
+            raw_data_store.append(raw) # Raw data stored
             message = json.dumps(filtered)
 
             if kafka_bridge is None:
