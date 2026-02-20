@@ -11,6 +11,8 @@ services:
       - KAFKA_PORT=${KAFKA_PORT}
       - KAFKA_TOPIC=network.data.ingested
       - CORS_ORIGINS=http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173
+      - HOST=data-ingestion
+      - PORT=7000
     networks:
       - nwdaf-network
 

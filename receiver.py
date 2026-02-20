@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Any, Dict, Set
 from contextlib import asynccontextmanager
@@ -8,6 +9,7 @@ import asyncio
 import logging
 from utils.kmw import PyKafBridge
 from collections import deque
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -16,6 +18,10 @@ logger = logging.getLogger(__name__)
 KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
 KAFKA_PORT = os.getenv("KAFKA_PORT", "9092")
 TOPIC      = os.getenv("KAFKA_TOPIC","network.data.ingested")
+
+# Subscribe
+HOST = os.getenv("HOST", "data-ingestion")
+PORT = os.getenv("PORT", 7000)
 
 raw_data_store = deque(maxlen=1000)  # Store last 1000 entries
 kafka_bridge = None
@@ -91,6 +97,9 @@ app.add_middleware(
 class DataPacket(BaseModel):
     data: Dict[str, Any]
 
+class SubscribeRequest(BaseModel):
+    producer_url : str
+
 # Fields to extract and send to Kafka (can be expanded later)
 REQUIRED_FIELDS = [
     "timestamp",
@@ -110,6 +119,10 @@ REQUIRED_FIELDS = [
     "altitude",
     "velocity",
 ]
+
+@app.post("/subscribe")
+async def subscribe_to_producer(request : SubscribeRequest):
+    requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
 
 @app.post("/receive")
 async def receive_data(request: Request):
