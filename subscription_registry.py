@@ -17,7 +17,6 @@ class SubscriptionRegistry:
         self.lock = threading.Lock()
 
     def add(self, subscription_id, url: str):
-        subscription_id = str(uuid.uuid4())
         with self.lock: 
             self.producers[subscription_id] = url
             self.producers_failures[subscription_id] = 0
@@ -41,7 +40,7 @@ class SubscriptionRegistry:
 
     def all_producers(self) -> Dict[str, str]:
         with self.lock:
-                return self.producers
+                return self.producers.copy()
 
     def get_url(self, id : str) -> str:
         return self.producers[id]

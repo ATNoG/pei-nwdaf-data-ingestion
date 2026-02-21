@@ -1,6 +1,6 @@
 import threading
 import time
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Any, Dict, Set
@@ -136,7 +136,7 @@ REQUIRED_FIELDS = [
     "velocity",
 ]
 
-@app.post("/subscribe")
+@app.post("/subscriptions")
 async def subscribe_to_producer(request : SubscribeRequest):
     response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
     try:
@@ -148,6 +148,33 @@ async def subscribe_to_producer(request : SubscribeRequest):
         logger.warning(f"Producer {request.producer_url} gave unexpected answer")
         return {"message" : "Producer gave unexpected answer"}
 
+@app.get("/subscriptions")
+async def get_subscriptions():
+    """
+    Returns all producers in the system
+    Returns in this format:
+    {"producers" : [{id : url}, {id : url}]}
+    """
+    producers = subscription_registry.all_producers()
+    producers_list = [ {p : producers[p] } for p in producers ]
+    return {"producers" : producers_list}   
+
+@app.delete("/subscriptions/{subscription_id}")
+async def unsubscrive_to_producer(subscription_id : str):
+    try:
+        url = subscription_registry.get_url(subscription_id)
+        if url[-1] == "/":
+            url = url[:-1]
+        response = requests.delete(f"{url}/{subscription_id}")
+        if response.status_code == 200:
+            subscription_registry.remove(subscription_id)
+            return ({"subscription_id" : subscription_id}, 200)
+        else:
+            raise HTTPException(status_code=response.status_code, detail=response.text)     
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    except :
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/receive")
 async def receive_data(request: Request):
@@ -162,6 +189,10 @@ async def receive_data(request: Request):
     try:
         id = data["subscription_id"]
         subscription_registry.received_data(id)
+        if id not in subscription_registry.all_producers():
+            print(id, subscription_registry.all_producers())
+            logger.warning("Received data from unsubscribed producer")
+            return ("Not subscribed", 403)
     except:
         logger.warning("Received unexpected data from producer")
 
