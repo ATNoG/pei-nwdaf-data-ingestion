@@ -46,26 +46,31 @@ kafka_bridge = None
 # WebSocket connection manager
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Set[WebSocket] = set()
+        self.active_connections: Dict[str, Set[WebSocket]] = {}
         self._lock = asyncio.Lock()
     
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, subscription_id : str):
         await websocket.accept()
         async with self._lock:
-            self.active_connections.add(websocket)
-        logger.info(f"WebSocket connected. Total connections: {len(self.active_connections)}")
+            if subscription_id not in self.active_connections:
+                self.active_connections[subscription_id] = set()
+            self.active_connections[subscription_id].add(websocket)
+        logger.info(f"WebSocket connected for producer {subscription_id}. Total connections: {len(self.active_connections)}")
     
     async def disconnect(self, websocket: WebSocket):
         async with self._lock:
-            self.active_connections.discard(websocket)
-        logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
-    
-    async def broadcast(self, message: dict):
+            for producer_id, connections in self.active_connections.items():
+                if websocket in connections:
+                    connections.discard(websocket)
+                    logger.info(f"WebSocket disconnected from producer {producer_id}. Remaining: {len(connections)}")
+                    break
+
+    async def broadcast(self, subscription_id : str, message: dict):
         """Broadcast message to all connected clients"""
         disconnected = set()
         
         async with self._lock:
-            connections = self.active_connections.copy()
+            connections = self.active_connections.get(subscription_id, set()).copy()
         
         for connection in connections:
             try:
@@ -76,7 +81,7 @@ class ConnectionManager:
         
         if disconnected:
             async with self._lock:
-                self.active_connections -= disconnected
+                self.active_connections[subscription_id] -= disconnected
 
 
 manager = ConnectionManager()
@@ -138,15 +143,23 @@ REQUIRED_FIELDS = [
 
 @app.post("/subscriptions")
 async def subscribe_to_producer(request : SubscribeRequest):
-    response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
     try:
+        response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
         response_json =json.loads(response.text)
         id = response_json["subscription_id"]
         subscription_registry.add(id, request.producer_url)
         logger.info(f"Producer {request.producer_url} added with subscription id: {id}")
+        return ({"id" : id}, 201)
+    except requests.exceptions.Timeout:
+        logger.warning(f"Producer {request.producer_url} didnt respond")
+        return ("Producer didnt respond", 504)
+
+    except requests.exceptions.ConnectionError:
+        logger.warning(f"Cannot connect to producer {request.producer_url}")
+        raise HTTPException(status_code=502, detail="Cannot connect to producer")
     except:
         logger.warning(f"Producer {request.producer_url} gave unexpected answer")
-        return {"message" : "Producer gave unexpected answer"}
+        return ({"message" : "Producer gave unexpected answer"}, 500)
 
 @app.get("/subscriptions")
 async def get_subscriptions():
@@ -232,7 +245,7 @@ async def receive_data(request: Request):
             if ok:
                 results.append({"status": "ok", "data": filtered})
                 # Broadcast to WebSocket clients
-                asyncio.create_task(manager.broadcast({
+                asyncio.create_task(manager.broadcast(id,{
                     "type": "data_ingested",
                     "data": filtered
                 }))
@@ -268,8 +281,8 @@ async def receive_data(request: Request):
         return {"status": "error", "message": "Failed to send to Kafka"}
 
 
-@app.websocket("/ws/ingestion")
-async def websocket_ingestion(websocket: WebSocket):
+app.websocket("/ws/ingestion/{subscription_id}")
+async def websocket_ingestion(websocket: WebSocket, subscription_id : str):
     """
     WebSocket endpoint for real-time data ingestion updates.
     
@@ -278,7 +291,7 @@ async def websocket_ingestion(websocket: WebSocket):
     Message format:
     - {"type": "data_ingested", "data": {...}}
     """
-    await manager.connect(websocket)
+    await manager.connect(websocket, subscription_id)
     
     try:
         while True:
