@@ -1,3 +1,5 @@
+import threading
+import time
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -7,6 +9,7 @@ import json
 import os
 import asyncio
 import logging
+from subscription_registry import SubscriptionRegistry
 from utils.kmw import PyKafBridge
 from collections import deque
 import requests
@@ -22,6 +25,19 @@ TOPIC      = os.getenv("KAFKA_TOPIC","network.data.ingested")
 # Subscribe
 HOST = os.getenv("HOST", "data-ingestion")
 PORT = os.getenv("PORT", 7000)
+PRODUCER_MAX_TIME_OUT = int(os.getenv("PRODUCER_MAX_TIMEOUT", 30))
+
+
+subscription_registry = SubscriptionRegistry(max_failures=5)
+#initialize thread to check producers
+def check_producers_life(subscription_registry : SubscriptionRegistry):
+    while True:
+        subscription_registry.update_producers_life(PRODUCER_MAX_TIME_OUT)
+        logger.info("Checking producers")
+        time.sleep(5)
+
+check_producers_thread = threading.Thread(target=check_producers_life, args=(subscription_registry,))
+check_producers_thread.start()
 
 raw_data_store = deque(maxlen=1000)  # Store last 1000 entries
 kafka_bridge = None
@@ -122,7 +138,16 @@ REQUIRED_FIELDS = [
 
 @app.post("/subscribe")
 async def subscribe_to_producer(request : SubscribeRequest):
-    requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
+    response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
+    try:
+        response_json =json.loads(response.text)
+        id = response_json["subscription_id"]
+        subscription_registry.add(id, request.producer_url)
+        logger.info(f"Producer {request.producer_url} added with subscription id: {id}")
+    except:
+        logger.warning(f"Producer {request.producer_url} gave unexpected answer")
+        return {"message" : "Producer gave unexpected answer"}
+
 
 @app.post("/receive")
 async def receive_data(request: Request):
@@ -133,6 +158,12 @@ async def receive_data(request: Request):
     """
     payload = await request.json()
     data = payload or {}
+    
+    try:
+        id = data["subscription_id"]
+        subscription_registry.received_data(id)
+    except:
+        logger.warning("Received unexpected data from producer")
 
     print("Received:", data)
     results = []
@@ -236,3 +267,6 @@ async def websocket_ingestion(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         await manager.disconnect(websocket)
+
+
+
