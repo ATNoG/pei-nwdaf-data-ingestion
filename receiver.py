@@ -1,4 +1,7 @@
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+import threading
+import time
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Any, Dict, Set
 from contextlib import asynccontextmanager
@@ -6,8 +9,10 @@ import json
 import os
 import asyncio
 import logging
+from subscription_registry import SubscriptionRegistry
 from utils.kmw import PyKafBridge
 from collections import deque
+import requests
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -17,6 +22,23 @@ KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
 KAFKA_PORT = os.getenv("KAFKA_PORT", "9092")
 TOPIC      = os.getenv("KAFKA_TOPIC","network.data.ingested")
 
+# Subscribe
+HOST = os.getenv("HOST", "data-ingestion")
+PORT = os.getenv("PORT", 7000)
+PRODUCER_MAX_TIME_OUT = int(os.getenv("PRODUCER_MAX_TIMEOUT", 30))
+
+
+subscription_registry = SubscriptionRegistry(max_failures=5)
+#initialize thread to check producers
+def check_producers_life(subscription_registry : SubscriptionRegistry):
+    while True:
+        subscription_registry.update_producers_life(PRODUCER_MAX_TIME_OUT)
+        logger.info("Checking producers")
+        time.sleep(5)
+
+check_producers_thread = threading.Thread(target=check_producers_life, args=(subscription_registry,))
+check_producers_thread.start()
+
 raw_data_store = deque(maxlen=1000)  # Store last 1000 entries
 kafka_bridge = None
 
@@ -24,26 +46,31 @@ kafka_bridge = None
 # WebSocket connection manager
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Set[WebSocket] = set()
+        self.active_connections: Dict[str, Set[WebSocket]] = {}
         self._lock = asyncio.Lock()
     
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, subscription_id : str):
         await websocket.accept()
         async with self._lock:
-            self.active_connections.add(websocket)
-        logger.info(f"WebSocket connected. Total connections: {len(self.active_connections)}")
+            if subscription_id not in self.active_connections:
+                self.active_connections[subscription_id] = set()
+            self.active_connections[subscription_id].add(websocket)
+        logger.info(f"WebSocket connected for producer {subscription_id}. Total connections: {len(self.active_connections)}")
     
     async def disconnect(self, websocket: WebSocket):
         async with self._lock:
-            self.active_connections.discard(websocket)
-        logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
-    
-    async def broadcast(self, message: dict):
+            for producer_id, connections in self.active_connections.items():
+                if websocket in connections:
+                    connections.discard(websocket)
+                    logger.info(f"WebSocket disconnected from producer {producer_id}. Remaining: {len(connections)}")
+                    break
+
+    async def broadcast(self, subscription_id : str, message: dict):
         """Broadcast message to all connected clients"""
         disconnected = set()
         
         async with self._lock:
-            connections = self.active_connections.copy()
+            connections = self.active_connections.get(subscription_id, set()).copy()
         
         for connection in connections:
             try:
@@ -54,7 +81,7 @@ class ConnectionManager:
         
         if disconnected:
             async with self._lock:
-                self.active_connections -= disconnected
+                self.active_connections[subscription_id] -= disconnected
 
 
 manager = ConnectionManager()
@@ -91,6 +118,9 @@ app.add_middleware(
 class DataPacket(BaseModel):
     data: Dict[str, Any]
 
+class SubscribeRequest(BaseModel):
+    producer_url : str
+
 # Fields to extract and send to Kafka (can be expanded later)
 REQUIRED_FIELDS = [
     "timestamp",
@@ -111,6 +141,54 @@ REQUIRED_FIELDS = [
     "velocity",
 ]
 
+@app.post("/subscriptions")
+async def subscribe_to_producer(request : SubscribeRequest):
+    try:
+        response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
+        response_json =json.loads(response.text)
+        id = response_json["subscription_id"]
+        subscription_registry.add(id, request.producer_url)
+        logger.info(f"Producer {request.producer_url} added with subscription id: {id}")
+        return ({"id" : id}, 201)
+    except requests.exceptions.Timeout:
+        logger.warning(f"Producer {request.producer_url} didnt respond")
+        return ("Producer didnt respond", 504)
+
+    except requests.exceptions.ConnectionError:
+        logger.warning(f"Cannot connect to producer {request.producer_url}")
+        raise HTTPException(status_code=502, detail="Cannot connect to producer")
+    except:
+        logger.warning(f"Producer {request.producer_url} gave unexpected answer")
+        return ({"message" : "Producer gave unexpected answer"}, 500)
+
+@app.get("/subscriptions")
+async def get_subscriptions():
+    """
+    Returns all producers in the system
+    Returns in this format:
+    {"producers" : [{id : url}, {id : url}]}
+    """
+    producers = subscription_registry.all_producers()
+    producers_list = [ {p : producers[p] } for p in producers ]
+    return {"producers" : producers_list}   
+
+@app.delete("/subscriptions/{subscription_id}")
+async def unsubscrive_to_producer(subscription_id : str):
+    try:
+        url = subscription_registry.get_url(subscription_id)
+        if url[-1] == "/":
+            url = url[:-1]
+        response = requests.delete(f"{url}/{subscription_id}")
+        if response.status_code == 200:
+            subscription_registry.remove(subscription_id)
+            return ({"subscription_id" : subscription_id}, 200)
+        else:
+            raise HTTPException(status_code=response.status_code, detail=response.text)     
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    except :
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 @app.post("/receive")
 async def receive_data(request: Request):
     """Receive a data packet (dict) and return only the required fields.
@@ -120,6 +198,16 @@ async def receive_data(request: Request):
     """
     payload = await request.json()
     data = payload or {}
+    
+    try:
+        id = data["subscription_id"]
+        subscription_registry.received_data(id)
+        if id not in subscription_registry.all_producers():
+            print(id, subscription_registry.all_producers())
+            logger.warning("Received data from unsubscribed producer")
+            return ("Not subscribed", 403)
+    except:
+        logger.warning("Received unexpected data from producer")
 
     print("Received:", data)
     results = []
@@ -157,7 +245,7 @@ async def receive_data(request: Request):
             if ok:
                 results.append({"status": "ok", "data": filtered})
                 # Broadcast to WebSocket clients
-                asyncio.create_task(manager.broadcast({
+                asyncio.create_task(manager.broadcast(id,{
                     "type": "data_ingested",
                     "data": filtered
                 }))
@@ -184,7 +272,7 @@ async def receive_data(request: Request):
 
     if success:
         # Broadcast to WebSocket clients
-        asyncio.create_task(manager.broadcast({
+        asyncio.create_task(manager.broadcast(id,{
             "type": "data_ingested",
             "data": filtered
         }))
@@ -193,8 +281,8 @@ async def receive_data(request: Request):
         return {"status": "error", "message": "Failed to send to Kafka"}
 
 
-@app.websocket("/ws/ingestion")
-async def websocket_ingestion(websocket: WebSocket):
+@app.websocket("/ws/ingestion/{subscription_id}")
+async def websocket_ingestion(websocket: WebSocket, subscription_id : str):
     """
     WebSocket endpoint for real-time data ingestion updates.
     
@@ -203,7 +291,7 @@ async def websocket_ingestion(websocket: WebSocket):
     Message format:
     - {"type": "data_ingested", "data": {...}}
     """
-    await manager.connect(websocket)
+    await manager.connect(websocket, subscription_id)
     
     try:
         while True:
@@ -223,3 +311,6 @@ async def websocket_ingestion(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         await manager.disconnect(websocket)
+
+
+
