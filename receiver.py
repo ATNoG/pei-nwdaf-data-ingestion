@@ -272,7 +272,7 @@ async def receive_data(request: Request):
 
     if success:
         # Broadcast to WebSocket clients
-        asyncio.create_task(manager.broadcast({
+        asyncio.create_task(manager.broadcast(id,{
             "type": "data_ingested",
             "data": filtered
         }))
@@ -281,7 +281,7 @@ async def receive_data(request: Request):
         return {"status": "error", "message": "Failed to send to Kafka"}
 
 
-app.websocket("/ws/ingestion/{subscription_id}")
+@app.websocket("/ws/ingestion/{subscription_id}")
 async def websocket_ingestion(websocket: WebSocket, subscription_id : str):
     """
     WebSocket endpoint for real-time data ingestion updates.
