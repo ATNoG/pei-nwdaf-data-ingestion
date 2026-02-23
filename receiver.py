@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, Set
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from utils.kmw import PyKafBridge
 
