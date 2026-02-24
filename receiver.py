@@ -9,7 +9,7 @@ from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Set
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from utils.kmw import PyKafBridge
@@ -129,7 +129,7 @@ class SubscribeRequest(BaseModel):
 # Fields to extract and send to Kafka (can be expanded later)
 
 
-@app.post("/subscriptions")
+@app.post("/subscriptions", status_code=201)
 async def subscribe_to_producer(request : SubscribeRequest):
     try:
         response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
@@ -137,17 +137,17 @@ async def subscribe_to_producer(request : SubscribeRequest):
         id = response_json["subscription_id"]
         subscription_registry.add(id, request.producer_url)
         logger.info(f"Producer {request.producer_url} added with subscription id: {id}")
-        return ({"id" : id}, 201)
+        return {"id" : id}
     except requests.exceptions.Timeout:
         logger.warning(f"Producer {request.producer_url} didnt respond")
-        return ("Producer didnt respond", 504)
+        raise HTTPException(status_code=504, detail="Producer didnt respond")
 
     except requests.exceptions.ConnectionError:
         logger.warning(f"Cannot connect to producer {request.producer_url}")
         raise HTTPException(status_code=502, detail="Cannot connect to producer")
     except:
         logger.warning(f"Producer {request.producer_url} gave unexpected answer")
-        return ({"message" : "Producer gave unexpected answer"}, 500)
+        raise HTTPException(status_code=500, detail="Producer gave unexpected answer")
 
 @app.get("/subscriptions")
 async def get_subscriptions():
@@ -169,12 +169,14 @@ async def unsubscrive_to_producer(subscription_id : str):
         response = requests.delete(f"{url}/{subscription_id}")
         if response.status_code == 200:
             subscription_registry.remove(subscription_id)
-            return ({"subscription_id" : subscription_id}, 200)
+            return {"subscription_id" : subscription_id}
         else:
             raise HTTPException(status_code=response.status_code, detail=response.text)     
     except KeyError:
         raise HTTPException(status_code=404, detail="Subscription not found")
-    except :
+    except HTTPException:
+        raise
+    except:
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/receive")
@@ -194,10 +196,12 @@ async def receive_data(request: Request):
         if id not in subscription_registry.all_producers():
             print(id, subscription_registry.all_producers())
             logger.warning("Received data from unsubscribed producer")
-            return ("Not subscribed", 403)
-    except:
+            raise HTTPException(status_code=403, detail="Not subscribed")
+    except KeyError:
         logger.warning("Received unexpected data from producer")
-        return ("Bad request", 400)
+        raise HTTPException(status_code=400, detail="Bad request")
+    except HTTPException:
+        raise
         
     print("Received:", data)
     results = []
