@@ -186,7 +186,8 @@ async def receive_data(request: Request):
     """
     payload = await request.json()
     data = payload or {}
-    
+    id = ""
+
     try:
         id = data["subscription_id"]
         subscription_registry.received_data(id)
@@ -196,7 +197,8 @@ async def receive_data(request: Request):
             return ("Not subscribed", 403)
     except:
         logger.warning("Received unexpected data from producer")
-
+        return ("Bad request", 400)
+        
     print("Received:", data)
     results = []
 
