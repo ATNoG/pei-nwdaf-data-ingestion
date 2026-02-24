@@ -1,13 +1,15 @@
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel
-from typing import Any, Dict, Set
-from contextlib import asynccontextmanager
-import json
-import os
 import asyncio
+import json
 import logging
-from utils.kmw import PyKafBridge
+import os
 from collections import deque
+from contextlib import asynccontextmanager
+from typing import Any, Dict, Set
+
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from utils.kmw import PyKafBridge
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -15,7 +17,9 @@ logger = logging.getLogger(__name__)
 # Kafka setup
 KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
 KAFKA_PORT = os.getenv("KAFKA_PORT", "9092")
-TOPIC      = os.getenv("KAFKA_TOPIC","network.data.ingested")
+TOPIC = os.getenv("KAFKA_TOPIC", "network.data.ingested")
+
+REQUIRED_FIELDS = {"timestamp", "cell_index"}
 
 raw_data_store = deque(maxlen=1000)  # Store last 1000 entries
 kafka_bridge = None
@@ -26,32 +30,36 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections: Set[WebSocket] = set()
         self._lock = asyncio.Lock()
-    
+
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         async with self._lock:
             self.active_connections.add(websocket)
-        logger.info(f"WebSocket connected. Total connections: {len(self.active_connections)}")
-    
+        logger.info(
+            f"WebSocket connected. Total connections: {len(self.active_connections)}"
+        )
+
     async def disconnect(self, websocket: WebSocket):
         async with self._lock:
             self.active_connections.discard(websocket)
-        logger.info(f"WebSocket disconnected. Total connections: {len(self.active_connections)}")
-    
+        logger.info(
+            f"WebSocket disconnected. Total connections: {len(self.active_connections)}"
+        )
+
     async def broadcast(self, message: dict):
         """Broadcast message to all connected clients"""
         disconnected = set()
-        
+
         async with self._lock:
             connections = self.active_connections.copy()
-        
+
         for connection in connections:
             try:
                 await connection.send_json(message)
             except Exception as e:
                 logger.error(f"Error broadcasting to client: {e}")
                 disconnected.add(connection)
-        
+
         if disconnected:
             async with self._lock:
                 self.active_connections -= disconnected
@@ -72,6 +80,7 @@ async def lifespan(app: FastAPI):
     # Shutdown: Stop Kafka bridge
     await kafka_bridge.close()
 
+
 # Initialize FastAPI app
 app = FastAPI(lifespan=lifespan)
 
@@ -87,29 +96,14 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+
 # Can be expanded later
 class DataPacket(BaseModel):
     data: Dict[str, Any]
 
+
 # Fields to extract and send to Kafka (can be expanded later)
-REQUIRED_FIELDS = [
-    "timestamp",
-    "datarate",
-    "mean_latency",
-    "rsrp",
-    "sinr",
-    "rsrq",
-    "direction",
-    "network",
-    "cqi",
-    "cell_index",
-    "primary_bandwidth",
-    "ul_bandwidth",
-    "latitude",
-    "longitude",
-    "altitude",
-    "velocity",
-]
+
 
 @app.post("/receive")
 async def receive_data(request: Request):
@@ -130,23 +124,24 @@ async def receive_data(request: Request):
         for entry in analytics_list:
             meta = entry.get("analyticsMetadata", {}) if isinstance(entry, dict) else {}
 
-            #ts = meta.get("timestamp") if meta.get("timestamp") is not None else entry.get("timestamp")
+            # ts = meta.get("timestamp") if meta.get("timestamp") is not None else entry.get("timestamp")
+            record = {**meta, "timestamp": entry.get("timestamp")}
+            missing = REQUIRED_FIELDS - record.keys()
+            if missing or any(record.get(f) is None for f in REQUIRED_FIELDS):
+                results.append(
+                    {
+                        "status": "error",
+                        "message": f"Missing mandatory fields: {missing or REQUIRED_FIELDS}",
+                    }
+                )
+                continue
 
-            raw = {}
-            filtered = {}
-            raw["timestamp"] = entry.get("timestamp")
-            filtered["timestamp"] = entry.get("timestamp")
-            for field in meta:
-                    if field in REQUIRED_FIELDS:
-                        filtered[field] = meta.get(field)
-                    raw[field] = meta.get(field)
-
-            raw_data_store.append(raw) # Raw data stored
-            message = json.dumps(filtered)
+            raw_data_store.append(record)  # Raw data stored
+            message = json.dumps(record)
 
             if kafka_bridge is None:
                 print("Kafka bridge not available - skipping produce (batch entry)")
-                results.append({"status": "no-kafka", "data": filtered})
+                results.append({"status": "no-kafka", "data": record})
                 continue
 
             try:
@@ -155,27 +150,35 @@ async def receive_data(request: Request):
                 ok = False
 
             if ok:
-                results.append({"status": "ok", "data": filtered})
+                results.append({"status": "ok", "data": record})
                 # Broadcast to WebSocket clients
-                asyncio.create_task(manager.broadcast({
-                    "type": "data_ingested",
-                    "data": filtered
-                }))
+                asyncio.create_task(
+                    manager.broadcast({"type": "data_ingested", "data": record})
+                )
             else:
-                results.append({"status": "error", "message": "Failed to send to Kafka", "data": filtered})
+                results.append(
+                    {
+                        "status": "error",
+                        "message": "Failed to send to Kafka",
+                        "data": record,
+                    }
+                )
 
         print(results)
 
         return {"results": results}
 
     # Fallback
-    filtered = {k: data.get(k) for k in REQUIRED_FIELDS}
-    message = json.dumps(filtered)
-
-    # Send to Kafka if available
+    missing = REQUIRED_FIELDS - data.keys()
+    if missing or any(data.get(f) is None for f in REQUIRED_FIELDS):
+        return {
+            "status": "error",
+            "message": f"Missing mandatory fields: {missing or REQUIRED_FIELDS}",
+        }
+    message = json.dumps(data)  # Send to Kafka if available
     if kafka_bridge is None:
         print("Kafka bridge not available - skipping produce")
-        return {"status": "no-kafka", "data": filtered}
+        return {"status": "no-kafka", "data": data}
 
     try:
         success = kafka_bridge.produce(TOPIC, message)
@@ -184,11 +187,8 @@ async def receive_data(request: Request):
 
     if success:
         # Broadcast to WebSocket clients
-        asyncio.create_task(manager.broadcast({
-            "type": "data_ingested",
-            "data": filtered
-        }))
-        return {"status": "ok", "data": filtered}
+        asyncio.create_task(manager.broadcast({"type": "data_ingested", "data": data}))
+        return {"status": "ok", "data": data}
     else:
         return {"status": "error", "message": "Failed to send to Kafka"}
 
@@ -197,19 +197,19 @@ async def receive_data(request: Request):
 async def websocket_ingestion(websocket: WebSocket):
     """
     WebSocket endpoint for real-time data ingestion updates.
-    
+
     Clients connect to this endpoint to receive live updates when data is ingested.
-    
+
     Message format:
     - {"type": "data_ingested", "data": {...}}
     """
     await manager.connect(websocket)
-    
+
     try:
         while True:
             # Keep connection alive and listen for client messages
             data = await websocket.receive_text()
-            
+
             # Handle ping/pong
             try:
                 message = json.loads(data)
@@ -217,7 +217,7 @@ async def websocket_ingestion(websocket: WebSocket):
                     await websocket.send_json({"type": "pong"})
             except json.JSONDecodeError:
                 logger.warning(f"Invalid JSON received: {data}")
-                
+
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
     except Exception as e:
