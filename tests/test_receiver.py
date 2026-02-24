@@ -18,6 +18,7 @@ def client(mock_kafka_bridge):
     """Create a test client with mocked Kafka bridge."""
     with patch("receiver.PyKafBridge", return_value=mock_kafka_bridge):
         from receiver import app
+
         with TestClient(app) as test_client:
             yield test_client
 
@@ -46,8 +47,8 @@ class TestReceiveEndpoint:
                         "latitude": 40.7128,
                         "longitude": -74.0060,
                         "altitude": 10.5,
-                        "velocity": 5.0
-                    }
+                        "velocity": 5.0,
+                    },
                 }
             ]
         }
@@ -71,12 +72,20 @@ class TestReceiveEndpoint:
             "analyticsData": [
                 {
                     "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {"datarate": 100.5, "rsrp": -80}
+                    "analyticsMetadata": {
+                        "datarate": 100.5,
+                        "rsrp": -80,
+                        "cell_index": 1,
+                    },
                 },
                 {
                     "timestamp": "2024-01-01T12:00:01Z",
-                    "analyticsMetadata": {"datarate": 105.2, "rsrp": -78}
-                }
+                    "analyticsMetadata": {
+                        "datarate": 105.2,
+                        "rsrp": -78,
+                        "cell_index": 1,
+                    },
+                },
             ]
         }
 
@@ -96,7 +105,8 @@ class TestReceiveEndpoint:
             "timestamp": "2024-01-01T12:00:00Z",
             "datarate": 100.5,
             "mean_latency": 20.3,
-            "rsrp": -80
+            "rsrp": -80,
+            "cell_index": 1,
         }
 
         response = client.post("/receive", json=payload)
@@ -108,16 +118,16 @@ class TestReceiveEndpoint:
         assert data["data"]["timestamp"] == "2024-01-01T12:00:00Z"
         assert data["data"]["datarate"] == 100.5
 
-    def test_receive_missing_fields_set_to_none(self, client, mock_kafka_bridge):
-        """Test that missing required fields are set to None."""
+    def test_receive_missing_mandatory_fields(self, client, mock_kafka_bridge):
+        """Test that missing cell_index or timestamp returns error."""
         payload = {
             "analyticsData": [
                 {
                     "timestamp": "2024-01-01T12:00:00Z",
                     "analyticsMetadata": {
                         "datarate": 100.5
-                        # All other fields missing
-                    }
+                        # cell_index missing
+                    },
                 }
             ]
         }
@@ -126,12 +136,8 @@ class TestReceiveEndpoint:
 
         assert response.status_code == 200
         data = response.json()
-        result_data = data["results"][0]["data"]
-
-        # Check that missing fields are None
-        assert result_data["mean_latency"] is None
-        assert result_data["rsrp"] is None
-        assert result_data["latitude"] is None
+        assert data["results"][0]["status"] == "error"
+        assert "cell_index" in data["results"][0]["message"]
 
     def test_receive_kafka_produce_failure(self, client, mock_kafka_bridge):
         """Test handling of Kafka produce failure."""
@@ -141,7 +147,7 @@ class TestReceiveEndpoint:
             "analyticsData": [
                 {
                     "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {"datarate": 100.5}
+                    "analyticsMetadata": {"datarate": 100.5, "cell_index": 1},
                 }
             ]
         }
@@ -161,7 +167,7 @@ class TestReceiveEndpoint:
             "analyticsData": [
                 {
                     "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {"datarate": 100.5}
+                    "analyticsMetadata": {"datarate": 100.5, "cell_index": 1},
                 }
             ]
         }
@@ -179,7 +185,7 @@ class TestReceiveEndpoint:
                 "analyticsData": [
                     {
                         "timestamp": "2024-01-01T12:00:00Z",
-                        "analyticsMetadata": {"datarate": 100.5}
+                        "analyticsMetadata": {"datarate": 100.5, "cell_index": 1},
                     }
                 ]
             }
@@ -200,11 +206,11 @@ class TestReceiveEndpoint:
         data = response.json()
         assert data["results"] == []
 
-    def test_receive_all_required_fields_extracted(self, client, mock_kafka_bridge):
-        """Test that all required fields are extracted correctly."""
+    def test_receive_all_fields_passthrough(self, client, mock_kafka_bridge):
+        """Test that all fields are passed through without filtering."""
         from receiver import REQUIRED_FIELDS
 
-        # Create complete metadata with all required fields
+        # Create complete metadata with various fields
         metadata = {
             "datarate": 100.5,
             "mean_latency": 20.3,
@@ -220,15 +226,13 @@ class TestReceiveEndpoint:
             "latitude": 40.7128,
             "longitude": -74.0060,
             "altitude": 10.5,
-            "velocity": 5.0
+            "velocity": 5.0,
+            "custom_field": "custom_value",  # Extra field
         }
 
         payload = {
             "analyticsData": [
-                {
-                    "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": metadata
-                }
+                {"timestamp": "2024-01-01T12:00:00Z", "analyticsMetadata": metadata}
             ]
         }
 
@@ -238,9 +242,13 @@ class TestReceiveEndpoint:
         data = response.json()
         result_data = data["results"][0]["data"]
 
-        # Verify all required fields are present
+        # Verify required fields are present
         for field in REQUIRED_FIELDS:
             assert field in result_data
+
+        # Verify custom field is also present (passthrough)
+        assert "custom_field" in result_data
+        assert result_data["custom_field"] == "custom_value"
 
     def test_kafka_message_format(self, client, mock_kafka_bridge):
         """Test that the Kafka message is properly JSON formatted."""
@@ -252,8 +260,9 @@ class TestReceiveEndpoint:
                     "timestamp": "2024-01-01T12:00:00Z",
                     "analyticsMetadata": {
                         "datarate": 100.5,
-                        "rsrp": -80
-                    }
+                        "rsrp": -80,
+                        "cell_index": 1,
+                    },
                 }
             ]
         }
@@ -271,3 +280,4 @@ class TestReceiveEndpoint:
         parsed_message = json.loads(message_arg)
         assert "timestamp" in parsed_message
         assert "datarate" in parsed_message
+        assert "cell_index" in parsed_message
