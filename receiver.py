@@ -11,6 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from utils.kmw import PyKafBridge
 
+from policy_client import PolicyClient
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,16 @@ logger = logging.getLogger(__name__)
 KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
 KAFKA_PORT = os.getenv("KAFKA_PORT", "9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "network.data.ingested")
+
+POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service:7777")
+POLICY_COMPONENT_ID = os.getenv("POLICY_COMPONENT_ID", "ingestion-service")
+POLICY_ENABLED = os.getenv("POLICY_ENABLED", "false").lower() == "true"
+
+policy_client = PolicyClient(
+    service_url=POLICY_SERVICE_URL,
+    component_id=POLICY_COMPONENT_ID,
+    enable_policy=POLICY_ENABLED
+)
 
 REQUIRED_FIELDS = {"timestamp", "cell_index"}
 
@@ -72,8 +84,19 @@ manager = ConnectionManager()
 async def lifespan(app: FastAPI):
 
     # Startup: Start Kafka bridge
-    global kafka_bridge
+    global kafka_bridge, policy_client
     kafka_bridge = PyKafBridge(TOPIC, hostname=KAFKA_HOST, port=KAFKA_PORT)
+
+    try:
+        await policy_client.register_component(
+            component_type="ingestion",
+            role="data_source",
+            data_columns=list(REQUIRED_FIELDS),
+            auto_create_attributes=True
+        )
+        logger.info("Component registered with Policy Service")
+    except Exception as e:
+        logger.warning(f"Failed to register with Policy Service: {e}")
 
     yield
 
@@ -112,6 +135,9 @@ async def receive_data(request: Request):
     For any REQUIRED_FIELDS key missing from the incoming packet, the
     returned value will be None.
     """
+
+    
+
     payload = await request.json()
     data = payload or {}
 
