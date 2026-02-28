@@ -39,7 +39,7 @@ def check_producers_life(subscription_registry : SubscriptionRegistry):
         logger.info("Checking producers")
         time.sleep(5)
 
-check_producers_thread = threading.Thread(target=check_producers_life, args=(subscription_registry,))
+check_producers_thread = threading.Thread(target=check_producers_life, args=(subscription_registry,), daemon=True)
 check_producers_thread.start()
 
 raw_data_store = deque(maxlen=1000)  # Store last 1000 entries
