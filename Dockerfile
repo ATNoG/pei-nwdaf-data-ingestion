@@ -25,6 +25,7 @@ RUN mkdir utils && cd utils \
 # Copy dependency files
 COPY requirements.txt ./
 COPY receiver.py .
+COPY subscription_registry.py .
 
 # Install dependencies using uv
 RUN uv pip install --system -r requirements.txt
