@@ -7,3 +7,6 @@ safety==2.3.5
 pytest==8.3.4
 httpx==0.28.1
 websockets==14.1
+# Policy Client SDK dependencies
+aiohttp>=3.9.0
+cachetools>=5.3.0

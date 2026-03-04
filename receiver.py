@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from utils.kmw import PyKafBridge
 
-from policy_client import PolicyClient
+from client import PolicyClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,7 +21,7 @@ KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
 KAFKA_PORT = os.getenv("KAFKA_PORT", "9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "network.data.ingested")
 
-POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service:7777")
+POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service:8000")
 POLICY_COMPONENT_ID = os.getenv("POLICY_COMPONENT_ID", "ingestion-service")
 POLICY_ENABLED = os.getenv("POLICY_ENABLED", "false").lower() == "true"
 
@@ -90,7 +90,7 @@ async def lifespan(app: FastAPI):
     try:
         await policy_client.register_component(
             component_type="ingestion",
-            role="data_source",
+            role=os.getenv("POLICY_ROLENAME", "Ingestion"),
             data_columns=list(REQUIRED_FIELDS),
             auto_create_attributes=True
         )
@@ -136,7 +136,9 @@ async def receive_data(request: Request):
     returned value will be None.
     """
 
-    
+    # Use the component_id as the source for policy checks when writing to Kafka
+    # The external client sending data is irrelevant - we (ingestion-service) are the source
+    source_id = POLICY_COMPONENT_ID
 
     payload = await request.json()
     data = payload or {}
@@ -163,12 +165,24 @@ async def receive_data(request: Request):
                 continue
 
             raw_data_store.append(record)  # Raw data stored
-            message = json.dumps(record)
 
             if kafka_bridge is None:
                 print("Kafka bridge not available - skipping produce (batch entry)")
                 results.append({"status": "no-kafka", "data": record})
                 continue
+
+            result = await policy_client.process_data(
+                source_id=source_id,
+                sink_id="kafka",
+                data=record,
+                action="write"
+            )
+
+            if not result.allowed:
+                logger.warning(f"Data filtered by policy: {result.reason}")
+                continue
+
+            message = json.dumps(result.data)
 
             try:
                 ok = kafka_bridge.produce(TOPIC, message)
