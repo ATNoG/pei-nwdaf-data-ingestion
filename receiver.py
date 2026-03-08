@@ -1,3 +1,4 @@
+from _typeshed import SupportsRichComparisonT
 import threading
 import time
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
@@ -121,6 +122,10 @@ class DataPacket(BaseModel):
 class SubscribeRequest(BaseModel):
     producer_url : str
 
+class HeartBeat(BaseModel):
+    id : str
+    status : str
+
 # Fields to extract and send to Kafka (can be expanded later)
 REQUIRED_FIELDS = [
     "timestamp",
@@ -188,6 +193,23 @@ async def unsubscrive_to_producer(subscription_id : str):
         raise HTTPException(status_code=404, detail="Subscription not found")
     except :
         raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/heartbeat")
+async def heartbeat(heartbeat : HeartBeat):
+    try:
+        id = heartbeat.id
+        status = heartbeat.status
+
+        if id not in subscription_registry.all_producers():
+            raise HTTPException(status_code=404, detail="Subscription not found")
+
+        if (status == "active"):
+            subscription_registry.received_data(id)
+        else:
+            subscription_registry.record_failure(id)
+    except:
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 
 @app.post("/receive")
 async def receive_data(request: Request):

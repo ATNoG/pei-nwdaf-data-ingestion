@@ -22,21 +22,29 @@ class SubscriptionRegistry:
             self.producers_failures[subscription_id] = 0
             self.producers_last_info[subscription_id] = int(time.time())
 
-    def remove(self, sub_id: str):
-        with self.lock:
-            self.producers.pop(sub_id, None)
-            self.producers_failures.pop(sub_id, None)
-            self.producers_last_info.pop(sub_id, None)
+    def remove(self, sub_id: str, use_lock : bool = True):
+        if use_lock:
+            self.lock.acquire()
 
-    def record_failure(self, id: str):
-        with self.lock:
-            if id in self.producers_failures:
-                self.producers_failures[id] += 1
-                logger.log(logging.INFO, f"Producer subscription with id:{id} took too long to respond")
-            
-                if self.producers_failures[id] >= self.max_failures:
-                    self.remove(id)
-                    logger.warning(f"{id} didnt respond {self.max_failures} times, assuming it is dead")
+        self.producers.pop(sub_id, None)
+        self.producers_failures.pop(sub_id, None)
+        self.producers_last_info.pop(sub_id, None)
+        
+        if use_lock:
+            self.lock.release()
+
+    def record_failure(self, id: str, use_lock : bool = True):
+        if use_lock:
+            self.lock.acquire()
+        if id in self.producers_failures:
+            self.producers_failures[id] += 1
+            logger.log(logging.INFO, f"Producer subscription with id:{id} took too long to respond")
+        
+            if self.producers_failures[id] >= self.max_failures:
+                self.remove(id, use_lock=False)
+                logger.warning(f"{id} didnt respond {self.max_failures} times, assuming it is dead")
+        if use_lock:
+            self.lock.release()
 
     def all_producers(self) -> Dict[str, str]:
         with self.lock:
@@ -51,14 +59,15 @@ class SubscriptionRegistry:
             self.producers_last_info[id] = now
 
     def update_producers_life(self, timeout : int):
-        to_remove = []
+        to_record_failure = []
         with self.lock:
             producers = self.producers
             now = int(time.time())
             for producer in producers:
                 last_info = self.producers_last_info[producer]
                 if now - last_info > timeout:
-                    to_remove.append(producer)
+                    to_record_failure.append(producer)
                     logger.info(f"Producer {producer} removed for timeout")
-        for prod_remove in to_remove:
-            self.remove(prod_remove)
+
+        for prod_remove in to_record_failure:
+            self.record_failure(prod_remove, use_lock=False)
