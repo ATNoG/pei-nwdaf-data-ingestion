@@ -70,4 +70,4 @@ class SubscriptionRegistry:
                     logger.info(f"Producer {producer} removed for timeout")
 
         for prod_remove in to_record_failure:
-            self.record_failure(prod_remove, use_lock=False)
+            self.record_failure(prod_remove)

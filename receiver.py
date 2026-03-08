@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-from _typeshed import SupportsRichComparisonT
 import threading
 import time
 import threading
@@ -138,7 +137,7 @@ class HeartBeat(BaseModel):
 @app.post("/subscriptions", status_code=201)
 async def subscribe_to_producer(request : SubscribeRequest):
     try:
-        response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
+        response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive", "heartbeat_url" : f"http://{HOST}:{PORT}/heartbeat"}, timeout=5)
         response_json =json.loads(response.text)
         id = response_json["subscription_id"]
         subscription_registry.add(id, request.producer_url)
@@ -226,7 +225,7 @@ async def receive_data(request: Request):
     except HTTPException:
         raise
         
-    print("Received:", data)
+    #print("Received:", data)
     results = []
 
     # Producer sends a batch under analyticsData where each element contains analyticsMetadata with the measurements
@@ -275,7 +274,7 @@ async def receive_data(request: Request):
                     }
                 )
 
-        print(results)
+        #print(results)
 
         return {"results": results}
 
