@@ -2,16 +2,20 @@ import asyncio
 import json
 import logging
 import os
+import time
+import threading
+import requests
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Set
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from utils.kmw import PyKafBridge
 
-from client import PolicyClient
+from policy_client import PolicyClient
+from subscription_registry import SubscriptionRegistry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,49 +25,115 @@ KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
 KAFKA_PORT = os.getenv("KAFKA_PORT", "9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "network.data.ingested")
 
-POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service:8000")
+POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service:8788")
 POLICY_COMPONENT_ID = os.getenv("POLICY_COMPONENT_ID", "ingestion-service")
 POLICY_ENABLED = os.getenv("POLICY_ENABLED", "false").lower() == "true"
+
+# Track all fields seen from incoming data
+_discovered_fields: set[str] = set()
+
+
+def get_discovered_fields() -> list[str]:
+    """Get all field names discovered from incoming data."""
+    return list(_discovered_fields)
+
 
 policy_client = PolicyClient(
     service_url=POLICY_SERVICE_URL,
     component_id=POLICY_COMPONENT_ID,
+    fields=get_discovered_fields,  # Function to get dynamic fields
     enable_policy=POLICY_ENABLED
 )
 
 REQUIRED_FIELDS = {"timestamp", "cell_index"}
 
+# Subscribe
+HOST = os.getenv("HOST", "data-ingestion")
+PORT = os.getenv("PORT", 7000)
+PRODUCER_MAX_TIME_OUT = int(os.getenv("PRODUCER_MAX_TIMEOUT", 30))
+
+
+subscription_registry = SubscriptionRegistry(max_failures=5)
+#initialize thread to check producers
+def check_producers_life(subscription_registry : SubscriptionRegistry):
+    while True:
+        subscription_registry.update_producers_life(PRODUCER_MAX_TIME_OUT)
+        logger.info("Checking producers")
+        time.sleep(5)
+
+
+check_producers_thread = threading.Thread(target=check_producers_life, args=(subscription_registry,), daemon=True)
+check_producers_thread.start()
+
 raw_data_store = deque(maxlen=1000)  # Store last 1000 entries
 kafka_bridge = None
+
+
+def build_allowed_fields() -> dict:
+    """
+    Build allowed_fields dict with producer categories for Policy registration.
+
+    Returns:
+        {
+            "ingestion-service:{subscription_id}": [fields],
+            "ingestion-service:{label}": [fields],
+        }
+    """
+    producers = subscription_registry.get_all_with_labels()
+    allowed_fields = {}
+
+    # Use discovered fields for all producers (they share the same schema)
+    fields_list = list(_discovered_fields) if _discovered_fields else []
+
+    for sub_id, info in producers.items():
+
+        # Add with subscription_id as key
+        allowed_fields[f"ingestion-service:{sub_id}"] = fields_list
+
+        # Also add with label as key (if different from sub_id)
+        label = info["label"]
+        if label != sub_id:
+            allowed_fields[f"ingestion-service:{label}"] = fields_list
+
+        # Also add with sanitized URL as key for readability
+        url = info["url"]
+        if url:
+            safe_url = url.replace("://", "_").replace("/", "_").replace(":", "_")
+            safe_url = safe_url.strip("_")[:30]  # Limit length
+            if safe_url:
+                allowed_fields[f"ingestion-service:{safe_url}"] = fields_list
+
+    return allowed_fields
 
 
 # WebSocket connection manager
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: Set[WebSocket] = set()
+        self.active_connections: Dict[str, Set[WebSocket]] = {}
         self._lock = asyncio.Lock()
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, subscription_id : str):
         await websocket.accept()
         async with self._lock:
-            self.active_connections.add(websocket)
-        logger.info(
-            f"WebSocket connected. Total connections: {len(self.active_connections)}"
-        )
+            if subscription_id not in self.active_connections:
+                self.active_connections[subscription_id] = set()
+            self.active_connections[subscription_id].add(websocket)
+        logger.info(f"WebSocket connected for producer {subscription_id}. Total connections: {len(self.active_connections)}")
 
     async def disconnect(self, websocket: WebSocket):
         async with self._lock:
-            self.active_connections.discard(websocket)
-        logger.info(
-            f"WebSocket disconnected. Total connections: {len(self.active_connections)}"
-        )
+            for producer_id, connections in self.active_connections.items():
+                if websocket in connections:
+                    connections.discard(websocket)
+                    logger.info(f"WebSocket disconnected from producer {producer_id}. Remaining: {len(connections)}")
+                    break
 
-    async def broadcast(self, message: dict):
+    async def broadcast(self, subscription_id : str, message: dict):
         """Broadcast message to all connected clients"""
         disconnected = set()
 
         async with self._lock:
-            connections = self.active_connections.copy()
+            connections = self.active_connections.get(subscription_id, set()).copy()
 
         for connection in connections:
             try:
@@ -74,7 +144,7 @@ class ConnectionManager:
 
         if disconnected:
             async with self._lock:
-                self.active_connections -= disconnected
+                self.active_connections[subscription_id] -= disconnected
 
 
 manager = ConnectionManager()
@@ -92,6 +162,7 @@ async def lifespan(app: FastAPI):
             component_type="ingestion",
             role=os.getenv("POLICY_ROLENAME", "Ingestion"),
             data_columns=list(REQUIRED_FIELDS),
+            allowed_fields=build_allowed_fields(),  # Producer categories
             auto_create_attributes=True
         )
         logger.info("Component registered with Policy Service")
@@ -124,9 +195,95 @@ app.add_middleware(
 class DataPacket(BaseModel):
     data: Dict[str, Any]
 
+class SubscribeRequest(BaseModel):
+    producer_url : str
 
 # Fields to extract and send to Kafka (can be expanded later)
 
+
+@app.post("/subscriptions", status_code=201)
+async def subscribe_to_producer(request : SubscribeRequest):
+    try:
+        response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
+        response_json =json.loads(response.text)
+        id = response_json["subscription_id"]
+        subscription_registry.add(id, request.producer_url)
+        logger.info(f"Producer {request.producer_url} added with subscription id: {id}")
+        return {"id" : id}
+    except requests.exceptions.Timeout:
+        logger.warning(f"Producer {request.producer_url} didnt respond")
+        raise HTTPException(status_code=504, detail="Producer didnt respond")
+
+    except requests.exceptions.ConnectionError:
+        logger.warning(f"Cannot connect to producer {request.producer_url}")
+        raise HTTPException(status_code=502, detail="Cannot connect to producer")
+    except:
+        logger.warning(f"Producer {request.producer_url} gave unexpected answer")
+        raise HTTPException(status_code=500, detail="Producer gave unexpected answer")
+
+@app.get("/subscriptions")
+async def get_subscriptions():
+    """
+    Returns all producers in the system with their labels.
+    Returns in this format:
+    {"producers" : [{sub_id : {url, label}}, {sub_id : {url, label}}]}
+    """
+    producers_with_labels = subscription_registry.get_all_with_labels()
+    producers_list = [{sub_id: {"url": info["url"], "label": info["label"]}} for sub_id, info in producers_with_labels.items()]
+    return {"producers": producers_list}   
+
+@app.put("/subscriptions/{subscription_id}/label")
+async def set_producer_label(subscription_id: str, label_data: dict):
+    """
+    Set a custom label for a producer.
+
+    Args:
+        subscription_id: The producer's subscription ID
+        label_data: {"label": "custom_label"}
+
+    Returns:
+        {"subscription_id": str, "label": str}
+    """
+    label = label_data.get("label", "").strip()
+    if not label:
+        raise HTTPException(status_code=400, detail="Label cannot be empty")
+
+    success = subscription_registry.set_label(subscription_id, label)
+    if not success:
+        raise HTTPException(status_code=404, detail="Producer not found")
+
+    # Re-register with Policy to update allowed_fields with new labels
+    try:
+        await policy_client.register_component(
+            component_type="ingestion",
+            role=os.getenv("POLICY_ROLENAME", "Ingestion"),
+            data_columns=list(_discovered_fields),
+            allowed_fields=build_allowed_fields(),  # Update with new label
+            auto_create_attributes=False  # Don't recreate attributes
+        )
+    except Exception as e:
+        logger.warning(f"Failed to update Policy registration after label change: {e}")
+
+    return {"subscription_id": subscription_id, "label": label}
+
+@app.delete("/subscriptions/{subscription_id}")
+async def unsubscrive_to_producer(subscription_id : str):
+    try:
+        url = subscription_registry.get_url(subscription_id)
+        if url[-1] == "/":
+            url = url[:-1]
+        response = requests.delete(f"{url}/{subscription_id}")
+        if response.status_code == 200:
+            subscription_registry.remove(subscription_id)
+            return {"subscription_id" : subscription_id}
+        else:
+            raise HTTPException(status_code=response.status_code, detail=response.text)     
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    except HTTPException:
+        raise
+    except:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/receive")
 async def receive_data(request: Request):
@@ -142,18 +299,61 @@ async def receive_data(request: Request):
 
     payload = await request.json()
     data = payload or {}
+    id = ""
 
-    print("Received:", data)
+    try:
+        id = data["subscription_id"]
+        subscription_registry.received_data(id)
+        if id not in subscription_registry.all_producers():
+            print(id, subscription_registry.all_producers())
+            logger.warning("Received data from unsubscribed producer")
+            raise HTTPException(status_code=403, detail="Not subscribed")
+    except KeyError:
+        logger.warning("Received unexpected data from producer")
+        raise HTTPException(status_code=400, detail="Bad request")
+    except HTTPException:
+        raise
+
+    logger.info(f"DEBUG: receive_data called, keys: {list(data.keys()) if isinstance(data, dict) else 'not dict'}")
     results = []
 
     # Producer sends a batch under analyticsData where each element contains analyticsMetadata with the measurements
     if isinstance(data, dict) and "analyticsData" in data:
+        logger.info("DEBUG: Processing analyticsData batch")
         analytics_list = data.get("analyticsData") or []
-        for entry in analytics_list:
+        logger.info(f"DEBUG: analytics_list has {len(analytics_list)} entries")
+        for i, entry in enumerate(analytics_list):
             meta = entry.get("analyticsMetadata", {}) if isinstance(entry, dict) else {}
 
             # ts = meta.get("timestamp") if meta.get("timestamp") is not None else entry.get("timestamp")
             record = {**meta, "timestamp": entry.get("timestamp")}
+
+            # Track all fields for policy field discovery
+            previous_field_count = len(_discovered_fields)
+            _discovered_fields.update(record.keys())
+
+            # Debug logging - log every time to see what's happening
+            logger.info(f"Field discovery: previous={previous_field_count}, current={len(_discovered_fields)}, record_keys={len(record.keys())}")
+
+            # Debug logging - use logger instead of print
+            if previous_field_count == 0:
+                logger.info(f"First data received! Discovered {len(_discovered_fields)} fields: {list(_discovered_fields)}")
+
+            # If new fields were discovered, re-register with Policy Service
+            if len(_discovered_fields) > previous_field_count:
+                logger.info(f"New fields discovered! Total: {len(_discovered_fields)}. Re-registering...")
+                try:
+                    await policy_client.register_component(
+                        component_type="ingestion",
+                        role=os.getenv("POLICY_ROLENAME", "Ingestion"),
+                        data_columns=list(_discovered_fields),
+                        allowed_fields=build_allowed_fields(),  # Update producer categories
+                        auto_create_attributes=True
+                    )
+                    logger.info(f"Updated component registration with {len(_discovered_fields)} fields")
+                except Exception as e:
+                    logger.warning(f"Failed to update component registration: {e}")
+
             missing = REQUIRED_FIELDS - record.keys()
             if missing or any(record.get(f) is None for f in REQUIRED_FIELDS):
                 results.append(
@@ -193,7 +393,7 @@ async def receive_data(request: Request):
                 results.append({"status": "ok", "data": record})
                 # Broadcast to WebSocket clients
                 asyncio.create_task(
-                    manager.broadcast({"type": "data_ingested", "data": record})
+                    manager.broadcast(id, {"type": "data_ingested", "data": record})
                 )
             else:
                 results.append(
@@ -227,14 +427,14 @@ async def receive_data(request: Request):
 
     if success:
         # Broadcast to WebSocket clients
-        asyncio.create_task(manager.broadcast({"type": "data_ingested", "data": data}))
+        asyncio.create_task(manager.broadcast(id,{"type": "data_ingested", "data": data}))
         return {"status": "ok", "data": data}
     else:
         return {"status": "error", "message": "Failed to send to Kafka"}
 
 
-@app.websocket("/ws/ingestion")
-async def websocket_ingestion(websocket: WebSocket):
+@app.websocket("/ws/ingestion/{subscription_id}")
+async def websocket_ingestion(websocket: WebSocket, subscription_id : str):
     """
     WebSocket endpoint for real-time data ingestion updates.
 
@@ -243,7 +443,7 @@ async def websocket_ingestion(websocket: WebSocket):
     Message format:
     - {"type": "data_ingested", "data": {...}}
     """
-    await manager.connect(websocket)
+    await manager.connect(websocket, subscription_id)
 
     try:
         while True:
@@ -263,3 +463,6 @@ async def websocket_ingestion(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         await manager.disconnect(websocket)
+
+
+

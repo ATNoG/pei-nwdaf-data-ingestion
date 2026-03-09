@@ -14,6 +14,9 @@ services:
       - POLICY_SERVICE_URL=${POLICY_SERVICE_URL}
       - POLICY_COMPONENT_ID=${POLICY_COMPONENT_ID}
       - POLICY_ENABLED=${POLICY_ENABLED}
+      - HOST=${HOST:-data-ingestion}
+      - PORT=7000
+      - PRODUCER_MAX_TIMEOUT=30
     networks:
       - nwdaf-network
 
