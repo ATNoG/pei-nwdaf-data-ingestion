@@ -42,7 +42,8 @@ policy_client = PolicyClient(
     service_url=POLICY_SERVICE_URL,
     component_id=POLICY_COMPONENT_ID,
     fields=get_discovered_fields,  # Function to get dynamic fields
-    enable_policy=POLICY_ENABLED
+    enable_policy=POLICY_ENABLED,
+    heartbeat_interval=30,
 )
 
 REQUIRED_FIELDS = {"timestamp", "cell_index"}
@@ -173,12 +174,15 @@ async def lifespan(app: FastAPI):
             auto_create_attributes=True
         )
         logger.info(f"Component registered with Policy Service ({len(startup_columns)} fields)")
+        # Keep registration alive across Policy restarts
+        await policy_client.start_heartbeat()
     except Exception as e:
         logger.warning(f"Failed to register with Policy Service: {e}")
 
     yield
 
-    # Shutdown: Stop Kafka bridge
+    # Shutdown
+    await policy_client.stop_heartbeat()
     await kafka_bridge.close()
 
 
