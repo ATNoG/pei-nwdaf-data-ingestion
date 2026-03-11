@@ -82,8 +82,11 @@ def build_allowed_fields() -> dict:
     producers = subscription_registry.get_all_with_labels()
     allowed_fields = {}
 
-    # Use discovered fields for all producers (they share the same schema)
-    fields_list = list(_discovered_fields) if _discovered_fields else []
+    # Use discovered fields for all producers (they share the same schema).
+    # Fall back to REQUIRED_FIELDS so that allowed_fields entries are never
+    # empty lists — an empty list causes the policy service's field discovery
+    # to return zero fields (no fallback to data_columns when keys exist).
+    fields_list = list(_discovered_fields) if _discovered_fields else list(REQUIRED_FIELDS)
 
     for sub_id, info in producers.items():
 
@@ -158,14 +161,18 @@ async def lifespan(app: FastAPI):
     kafka_bridge = PyKafBridge(TOPIC, hostname=KAFKA_HOST, port=KAFKA_PORT)
 
     try:
+        # Use discovered fields if available (e.g. from a previous run still in
+        # memory), otherwise seed with REQUIRED_FIELDS so the policy service
+        # always knows at least about the mandatory columns.
+        startup_columns = list(_discovered_fields) if _discovered_fields else list(REQUIRED_FIELDS)
         await policy_client.register_component(
             component_type="ingestion",
             role=os.getenv("POLICY_ROLENAME", "Ingestion"),
-            data_columns=list(REQUIRED_FIELDS),
+            data_columns=startup_columns,
             allowed_fields=build_allowed_fields(),  # Producer categories
             auto_create_attributes=True
         )
-        logger.info("Component registered with Policy Service")
+        logger.info(f"Component registered with Policy Service ({len(startup_columns)} fields)")
     except Exception as e:
         logger.warning(f"Failed to register with Policy Service: {e}")
 

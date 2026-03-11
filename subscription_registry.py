@@ -61,6 +61,43 @@ class SubscriptionRegistry:
         with self.lock:
             return self.producers.copy()
 
+    def get_all_with_status(self, timeout: int) -> Dict[str, list]:
+        """
+        Return producers grouped by active/inactive status.
+
+        Args:
+            timeout: Seconds threshold for considering a producer inactive.
+                    Uses PRODUCER_MAX_TIME_OUT value (typically 30s).
+
+        Returns:
+            {
+                "active": [{sub_id: {url, label, last_seen}}, ...],
+                "inactive": [{sub_id: {url, label, last_seen}}, ...]
+            }
+        """
+        with self.lock:
+            now = int(time.time())
+            active = []
+            inactive = []
+
+            for sub_id, url in self.producers.items():
+                label = self.producers_labels.get(sub_id, sub_id)
+                last_seen = self.producers_last_info.get(sub_id, 0)
+                producer_info = {
+                    sub_id: {
+                        "url": url,
+                        "label": label,
+                        "last_seen": last_seen
+                    }
+                }
+
+                if now - last_seen <= timeout:
+                    active.append(producer_info)
+                else:
+                    inactive.append(producer_info)
+
+            return {"active": active, "inactive": inactive}
+
     def record_failure(self, id: str):
         with self.lock:
             if id in self.producers_failures:
