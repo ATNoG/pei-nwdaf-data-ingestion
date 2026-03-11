@@ -11,6 +11,9 @@ services:
       - KAFKA_PORT=${KAFKA_PORT}
       - KAFKA_TOPIC=network.data.ingested
       - CORS_ORIGINS=http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173
+      - POLICY_SERVICE_URL=${POLICY_SERVICE_URL}
+      - POLICY_COMPONENT_ID=${POLICY_COMPONENT_ID}
+      - POLICY_ENABLED=${POLICY_ENABLED}
       - HOST=${HOST:-data-ingestion}
       - PORT=7000
       - PRODUCER_MAX_TIMEOUT=30
