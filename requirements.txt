@@ -8,4 +8,4 @@ pytest==8.3.4
 httpx==0.28.1
 websockets==14.1
 # Policy Client SDK dependencies
-policy-client-sdk @ git+https://github.com/ATNoG/pei-nwdaf-policy.git@feature/pipe#subdirectory=client_sdk
+policy-client-sdk @ git+https://github.com/ATNoG/pei-nwdaf-policy.git#subdirectory=client_sdk
