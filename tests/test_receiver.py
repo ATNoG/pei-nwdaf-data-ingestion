@@ -430,10 +430,10 @@ class TestSubscriptionEndpoints:
 
     def test_get_subscriptions_with_producers(self, client, mock_subscription_registry):
         """Test getting subscriptions with existing producers."""
-        mock_subscription_registry.all_producers.return_value = {
-            "sub-1": "http://producer1:8000/subscribe",
-            "sub-2": "http://producer2:8000/subscribe",
-            "sub-3": "http://producer3:8000/subscribe"
+        mock_subscription_registry.get_all_with_labels.return_value = {
+            "sub-1": {"url": "http://producer1:8000/subscribe", "label": "sub-1"},
+            "sub-2": {"url": "http://producer2:8000/subscribe", "label": "sub-2"},
+            "sub-3": {"url": "http://producer3:8000/subscribe", "label": "sub-3"},
         }
 
         response = client.get("/subscriptions")
