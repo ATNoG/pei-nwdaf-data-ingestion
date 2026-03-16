@@ -411,7 +411,7 @@ wheels = [
 [[package]]
 name = "ingestion"
 version = "0.1.0"
-source = { editable = "." }
+source = { virtual = "." }
 dependencies = [
     { name = "confluent-kafka" },
     { name = "fastapi" },
