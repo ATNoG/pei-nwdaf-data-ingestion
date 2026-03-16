@@ -23,10 +23,10 @@ RUN mkdir utils && cd utils \
 
 
 # Copy dependency files
-COPY requirements.txt ./
+COPY pyproject.toml uv.lock ./
 COPY receiver.py .
 COPY subscription_registry.py .
 
 # Install dependencies using uv
-RUN uv pip install --system -r requirements.txt
-CMD ["uvicorn", "receiver:app", "--host", "0.0.0.0", "--port", "7000"]
+RUN uv sync --no-install-project
+CMD ["uv", "run", "--no-project" ,"uvicorn", "receiver:app", "--host", "0.0.0.0", "--port", "7000"]
