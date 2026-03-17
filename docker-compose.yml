@@ -7,15 +7,15 @@ services:
     ports:
       - "7000:7000"
     environment:
-      - KAFKA_HOST=kafka
+      - KAFKA_HOST=${KAFKA_HOST}
       - KAFKA_PORT=${KAFKA_PORT}
       - KAFKA_TOPIC=network.data.ingested
-      - CORS_ORIGINS=http://localhost:5173,http://localhost:3000,http://127.0.0.1:5173
+      - CORS_ORIGINS=${DASHBOARD_URL},http://localhost:3000,http://127.0.0.1:5173
       - POLICY_SERVICE_URL=${POLICY_SERVICE_URL}
-      - POLICY_COMPONENT_ID=${POLICY_COMPONENT_ID}
+      - POLICY_COMPONENT_ID=data-ingestion
       - POLICY_ENABLED=${POLICY_ENABLED}
-      - POLICY_ROLENAME=${POLICY_ROLENAME:-Ingestion}
-      - HOST=${HOST:-data-ingestion}
+      - POLICY_ROLENAME=ingestion
+      - HOST=${INGESTION_HOST:-data-ingestion}
       - PORT=7000
       - PRODUCER_MAX_TIMEOUT=30
     networks:
