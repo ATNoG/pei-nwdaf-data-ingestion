@@ -120,8 +120,12 @@ class TestReceiveEndpoint:
         assert len(data["results"]) == 2
         assert all(result["status"] == "ok" for result in data["results"])
 
-        # Verify Kafka produce was called twice
-        assert mock_kafka_bridge.produce.call_count >= 2
+        # Verify Kafka produce was called once with the whole batch
+        mock_kafka_bridge.produce.assert_called_once()
+        call_args = mock_kafka_bridge.produce.call_args[0]
+        batch = json.loads(call_args[1])
+        assert isinstance(batch, list)
+        assert len(batch) == 2
 
     def test_receive_fallback_single_packet(self, client, mock_kafka_bridge, mock_subscription_registry):
         """Test fallback case when data doesn't have analyticsData structure."""
@@ -189,7 +193,7 @@ class TestReceiveEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert data["results"][0]["status"] == "error"
-        assert "Failed to send to Kafka" in data["results"][0]["message"]
+        assert "Failed to send batch to Kafka" in data["results"][0]["message"]
 
     def test_receive_kafka_produce_exception(self, client, mock_kafka_bridge, mock_subscription_registry):
         """Test handling of Kafka produce exception."""
@@ -324,11 +328,13 @@ class TestReceiveEndpoint:
         topic_arg, message_arg = call_args[0]
 
         assert topic_arg == TOPIC
-        # Verify it's valid JSON
+        # Verify it's valid JSON - now a batch (list of records)
         parsed_message = json.loads(message_arg)
-        assert "timestamp" in parsed_message
-        assert "datarate" in parsed_message
-        assert "cell_index" in parsed_message
+        assert isinstance(parsed_message, list)
+        assert len(parsed_message) == 1
+        assert "timestamp" in parsed_message[0]
+        assert "datarate" in parsed_message[0]
+        assert "cell_index" in parsed_message[0]
 
 
 class TestSubscriptionEndpoints:

@@ -378,7 +378,6 @@ async def receive_data(request: Request):
             raw_data_store.append(record)  # Raw data stored
 
             if kafka_bridge is None:
-                print("Kafka bridge not available - skipping produce (batch entry)")
                 results.append({"status": "no-kafka", "data": record})
                 continue
 
@@ -393,29 +392,26 @@ async def receive_data(request: Request):
                 logger.warning(f"Data filtered by policy: {result.reason}")
                 continue
 
-            message = json.dumps(result.data)
+            results.append({"status": "ok", "data": result.data})
 
+        # Send the whole batch as a single Kafka message
+        batch = [r["data"] for r in results if r["status"] == "ok"]
+        if batch and kafka_bridge is not None:
+            message = json.dumps(batch)
             try:
                 ok = kafka_bridge.produce(TOPIC, message)
             except Exception:
                 ok = False
 
             if ok:
-                results.append({"status": "ok", "data": record})
-                # Broadcast to WebSocket clients
-                asyncio.create_task(
-                    manager.broadcast(id, {"type": "data_ingested", "data": record})
-                )
+                logger.info(f"Produced batch of {len(batch)} records to Kafka")
+                for record in batch:
+                    asyncio.create_task(
+                        manager.broadcast(id, {"type": "data_ingested", "data": record})
+                    )
             else:
-                results.append(
-                    {
-                        "status": "error",
-                        "message": "Failed to send to Kafka",
-                        "data": record,
-                    }
-                )
-
-        print(results)
+                logger.error(f"Failed to produce batch of {len(batch)} records")
+                results = [{"status": "error", "message": "Failed to send batch to Kafka"}]
 
         return {"results": results}
 
