@@ -54,7 +54,7 @@ PORT = os.getenv("PORT", 7000)
 PRODUCER_MAX_TIME_OUT = int(os.getenv("PRODUCER_MAX_TIMEOUT", 30))
 
 
-subscription_registry = SubscriptionRegistry(max_failures=5)
+subscription_registry = SubscriptionRegistry()
 #initialize thread to check producers
 def check_producers_life(subscription_registry : SubscriptionRegistry):
     while True:
@@ -222,7 +222,7 @@ async def heartbeat(subscription_id: str):
 @app.post("/subscriptions", status_code=201)
 async def subscribe_to_producer(request : SubscribeRequest):
     try:
-        response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
+        response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive", "hearbeat_url" : f"http://{HOST}:{PORT}/heartbeat"}, timeout=5)
         response_json =json.loads(response.text)
         id = response_json["subscription_id"]
         subscription_registry.add(id, request.producer_url)
@@ -244,7 +244,7 @@ async def get_subscriptions():
     """
     Returns all producers in the system with their labels.
     Returns in this format:
-    {"producers" : [{sub_id : {url, label}}, {sub_id : {url, label}}]}
+    {"producers" : [{sub_id : {url, label, active}}, {sub_id : {url, label, active}}]}
     """
     producers_with_labels = subscription_registry.get_all_with_labels()
     producers_list = [{sub_id: {"url": info["url"], "label": info["label"]}} for sub_id, info in producers_with_labels.items()]
