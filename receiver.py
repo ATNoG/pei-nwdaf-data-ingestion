@@ -211,6 +211,13 @@ class SubscribeRequest(BaseModel):
 
 # Fields to extract and send to Kafka (can be expanded later)
 
+@app.post("/heartbeat/{subscription_id}", status_code=200)
+async def heartbeat(subscription_id: str):
+    if subscription_id not in subscription_registry.all_producers():
+        raise HTTPException(status_code=404, detail="Producer not registered")
+    
+    subscription_registry.received_data(subscription_id)
+    return {"status": "ok"}
 
 @app.post("/subscriptions", status_code=201)
 async def subscribe_to_producer(request : SubscribeRequest):
