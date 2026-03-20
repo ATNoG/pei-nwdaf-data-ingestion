@@ -361,7 +361,7 @@ async def receive_data(request: Request):
                 logger.info(f"First data received! Discovered {len(_discovered_fields)} fields: {list(_discovered_fields)}")
 
             # If new fields were discovered, re-register with Policy Service
-            if len(_discovered_fields) > previous_field_count:
+            if len(_discovered_fields) > previous_field_count and POLICY_ENABLED:
                 logger.info(f"New fields discovered! Total: {len(_discovered_fields)}. Re-registering...")
                 try:
                     await policy_client.register_component(
