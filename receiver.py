@@ -4,10 +4,10 @@ import logging
 import os
 import time
 import threading
-import requests
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Set
+import httpx
 
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -53,18 +53,14 @@ HOST = os.getenv("HOST", "data-ingestion")
 PORT = os.getenv("PORT", 7000)
 PRODUCER_MAX_TIME_OUT = int(os.getenv("PRODUCER_MAX_TIMEOUT", 30))
 
-
 subscription_registry = SubscriptionRegistry()
-#initialize thread to check producers
-def check_producers_life(subscription_registry : SubscriptionRegistry):
+async def check_producers_life(subscription_registry : SubscriptionRegistry):
     while True:
         subscription_registry.update_producers_life(PRODUCER_MAX_TIME_OUT)
         logger.info("Checking producers")
-        time.sleep(5)
+        await asyncio.sleep(5)
 
 
-check_producers_thread = threading.Thread(target=check_producers_life, args=(subscription_registry,), daemon=True)
-check_producers_thread.start()
 
 raw_data_store = deque(maxlen=1000)  # Store last 1000 entries
 kafka_bridge = None
@@ -158,8 +154,9 @@ manager = ConnectionManager()
 async def lifespan(app: FastAPI):
 
     # Startup: Start Kafka bridge
-    global kafka_bridge, policy_client
+    global kafka_bridge, policy_client, http_client
     kafka_bridge = PyKafBridge(TOPIC, hostname=KAFKA_HOST, port=KAFKA_PORT)
+    http_client = httpx.AsyncClient(timeout=5.0)
 
     try:
         # Use discovered fields if available (e.g. from a previous run still in
@@ -176,6 +173,9 @@ async def lifespan(app: FastAPI):
         logger.info(f"Component registered with Policy Service ({len(startup_columns)} fields)")
         # Keep registration alive across Policy restarts
         await policy_client.start_heartbeat()
+        
+        #check producers life
+        asyncio.create_task(check_producers_life(subscription_registry))
     except Exception as e:
         logger.warning(f"Failed to register with Policy Service: {e}")
 
@@ -222,17 +222,19 @@ async def heartbeat(subscription_id: str):
 @app.post("/subscriptions", status_code=201)
 async def subscribe_to_producer(request : SubscribeRequest):
     try:
-        response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive", "hearbeat_url" : f"http://{HOST}:{PORT}/heartbeat"}, timeout=5)
-        response_json =json.loads(response.text)
+        request_to_producer = {"url" : f"http://{HOST}:{PORT}/receive", "heartbeat_url" : f"http://{HOST}:{PORT}/heartbeat"}
+
+        response = await http_client.post(request.producer_url, json=request_to_producer)
+        response_json = response.json()
         id = response_json["subscription_id"]
         subscription_registry.add(id, request.producer_url)
         logger.info(f"Producer {request.producer_url} added with subscription id: {id}")
         return {"id" : id}
-    except requests.exceptions.Timeout:
+    except httpx.exceptions.Timeout:
         logger.warning(f"Producer {request.producer_url} didnt respond")
         raise HTTPException(status_code=504, detail="Producer didnt respond")
 
-    except requests.exceptions.ConnectionError:
+    except httpx.exceptions.ConnectionError:
         logger.warning(f"Cannot connect to producer {request.producer_url}")
         raise HTTPException(status_code=502, detail="Cannot connect to producer")
     except:
@@ -290,7 +292,7 @@ async def unsubscrive_to_producer(subscription_id : str):
         url = subscription_registry.get_url(subscription_id)
         if url[-1] == "/":
             url = url[:-1]
-        response = requests.delete(f"{url}/{subscription_id}")
+        response = await http_client.delete(f"{url}/{subscription_id}")
         if response.status_code == 200:
             subscription_registry.remove(subscription_id)
             return {"subscription_id" : subscription_id}
@@ -310,7 +312,8 @@ async def receive_data(request: Request):
     For any REQUIRED_FIELDS key missing from the incoming packet, the
     returned value will be None.
     """
-
+    
+    print("RECEIVED FROM PRODUCER")
     # Use the component_id as the source for policy checks when writing to Kafka
     # The external client sending data is irrelevant - we (ingestion-service) are the source
     source_id = POLICY_COMPONENT_ID

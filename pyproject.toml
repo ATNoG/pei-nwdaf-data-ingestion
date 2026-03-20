@@ -12,6 +12,7 @@ dependencies = [
     "websockets==14.1",
     "requests>=2.32",
     "policy-client-sdk @ git+https://github.com/ATNoG/pei-nwdaf-policy.git#subdirectory=client_sdk",
+    "httpx==0.23.2"
 ]
 
 [project.optional-dependencies]
@@ -19,7 +20,7 @@ dev = [
     "bandit==1.8.0",
     "safety==2.3.5",
     "pytest==8.3.4",
-    "httpx==0.28.1",
+    #"httpx==0.28.1",
 ]
 
 [build-system]
