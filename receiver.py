@@ -249,7 +249,7 @@ async def get_subscriptions():
     {"producers" : [{sub_id : {url, label, active}}, {sub_id : {url, label, active}}]}
     """
     producers_with_labels = subscription_registry.get_all_with_labels()
-    producers_list = [{sub_id: {"url": info["url"], "label": info["label"]}} for sub_id, info in producers_with_labels.items()]
+    producers_list = [{sub_id: {"url": info["url"], "label": info["label"], "active" : info["active"]}} for sub_id, info in producers_with_labels.items()]
     return {"producers": producers_list}   
 
 @app.put("/subscriptions/{subscription_id}/label")
