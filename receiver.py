@@ -4,10 +4,10 @@ import logging
 import os
 import time
 import threading
-import requests
 from collections import deque
 from contextlib import asynccontextmanager
 from typing import Any, Dict, Set
+import httpx
 
 from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -53,18 +53,27 @@ HOST = os.getenv("HOST", "data-ingestion")
 PORT = os.getenv("PORT", 7000)
 PRODUCER_MAX_TIME_OUT = int(os.getenv("PRODUCER_MAX_TIMEOUT", 30))
 
-
-subscription_registry = SubscriptionRegistry(max_failures=5)
-#initialize thread to check producers
-def check_producers_life(subscription_registry : SubscriptionRegistry):
+subscription_registry = SubscriptionRegistry()
+async def check_producers_life(subscription_registry : SubscriptionRegistry):
+    logger.info("Checking producers")
     while True:
-        subscription_registry.update_producers_life(PRODUCER_MAX_TIME_OUT)
+        producers = subscription_registry.get_all_active_producers()
+        for prod in producers:
+            heartbeat_url = subscription_registry.get_heartbeat_url(prod)
+            try:
+                response = await http_client.get(heartbeat_url)
+                if response.status_code == 200:
+                    subscription_registry.record_success(prod)
+                else:
+                    logger.warning(f"Producer {prod} returned unexpected status {response.status_code}")
+                    subscription_registry.record_failure(prod)
+            except Exception as e:
+                logger.warning(f"Producer {prod} heartbeat failed: {e}")
+                subscription_registry.record_failure(prod)
         logger.info("Checking producers")
-        time.sleep(5)
+        await asyncio.sleep(5)
 
 
-check_producers_thread = threading.Thread(target=check_producers_life, args=(subscription_registry,), daemon=True)
-check_producers_thread.start()
 
 raw_data_store = deque(maxlen=1000)  # Store last 1000 entries
 kafka_bridge = None
@@ -158,8 +167,9 @@ manager = ConnectionManager()
 async def lifespan(app: FastAPI):
 
     # Startup: Start Kafka bridge
-    global kafka_bridge, policy_client
+    global kafka_bridge, policy_client, http_client
     kafka_bridge = PyKafBridge(TOPIC, hostname=KAFKA_HOST, port=KAFKA_PORT)
+    http_client = httpx.AsyncClient(timeout=5.0)
 
     try:
         # Use discovered fields if available (e.g. from a previous run still in
@@ -176,6 +186,9 @@ async def lifespan(app: FastAPI):
         logger.info(f"Component registered with Policy Service ({len(startup_columns)} fields)")
         # Keep registration alive across Policy restarts
         await policy_client.start_heartbeat()
+        
+        #check producers life
+        asyncio.create_task(check_producers_life(subscription_registry))
     except Exception as e:
         logger.warning(f"Failed to register with Policy Service: {e}")
 
@@ -211,21 +224,31 @@ class SubscribeRequest(BaseModel):
 
 # Fields to extract and send to Kafka (can be expanded later)
 
+@app.post("/heartbeat/{subscription_id}", status_code=200)
+async def heartbeat(subscription_id: str):
+    if subscription_id not in subscription_registry.all_producers():
+        raise HTTPException(status_code=404, detail="Producer not registered")
+    
+    subscription_registry.received_data(subscription_id)
+    return {"status": "ok"}
 
 @app.post("/subscriptions", status_code=201)
 async def subscribe_to_producer(request : SubscribeRequest):
     try:
-        response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
-        response_json =json.loads(response.text)
+        request_to_producer = {"url" : f"http://{HOST}:{PORT}/receive", "heartbeat_url" : f"http://{HOST}:{PORT}/heartbeat"}
+
+        response = await http_client.post(request.producer_url, json=request_to_producer)
+        response_json = response.json()
         id = response_json["subscription_id"]
-        subscription_registry.add(id, request.producer_url)
+        heartbeat_url = response_json["heartbeat_url"]
+        subscription_registry.add(id, request.producer_url, heartbeat_url)
         logger.info(f"Producer {request.producer_url} added with subscription id: {id}")
         return {"id" : id}
-    except requests.exceptions.Timeout:
+    except httpx.TimeoutException:
         logger.warning(f"Producer {request.producer_url} didnt respond")
         raise HTTPException(status_code=504, detail="Producer didnt respond")
 
-    except requests.exceptions.ConnectionError:
+    except httpx.ConnectError:
         logger.warning(f"Cannot connect to producer {request.producer_url}")
         raise HTTPException(status_code=502, detail="Cannot connect to producer")
     except:
@@ -237,7 +260,7 @@ async def get_subscriptions():
     """
     Returns all producers in the system with their labels.
     Returns in this format:
-    {"producers" : [{sub_id : {url, label}}, {sub_id : {url, label}}]}
+    {"producers" : [{sub_id : {url, label, active}}, {sub_id : {url, label, active}}]}
     """
     producers_with_labels = subscription_registry.get_all_with_labels()
     producers_list = [{sub_id: {"url": info["url"], "label": info["label"]}} for sub_id, info in producers_with_labels.items()]
@@ -283,7 +306,7 @@ async def unsubscrive_to_producer(subscription_id : str):
         url = subscription_registry.get_url(subscription_id)
         if url[-1] == "/":
             url = url[:-1]
-        response = requests.delete(f"{url}/{subscription_id}")
+        response = await http_client.delete(f"{url}/{subscription_id}")
         if response.status_code == 200:
             subscription_registry.remove(subscription_id)
             return {"subscription_id" : subscription_id}
@@ -303,7 +326,8 @@ async def receive_data(request: Request):
     For any REQUIRED_FIELDS key missing from the incoming packet, the
     returned value will be None.
     """
-
+    
+    print("RECEIVED FROM PRODUCER")
     # Use the component_id as the source for policy checks when writing to Kafka
     # The external client sending data is irrelevant - we (ingestion-service) are the source
     source_id = POLICY_COMPONENT_ID
@@ -351,7 +375,7 @@ async def receive_data(request: Request):
                 logger.info(f"First data received! Discovered {len(_discovered_fields)} fields: {list(_discovered_fields)}")
 
             # If new fields were discovered, re-register with Policy Service
-            if len(_discovered_fields) > previous_field_count:
+            if len(_discovered_fields) > previous_field_count and POLICY_ENABLED:
                 logger.info(f"New fields discovered! Total: {len(_discovered_fields)}. Re-registering...")
                 try:
                     await policy_client.register_component(
