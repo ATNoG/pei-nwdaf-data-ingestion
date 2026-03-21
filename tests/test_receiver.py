@@ -2,7 +2,6 @@ import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import MagicMock, patch, AsyncMock, Mock
 import json
-import requests
 
 
 SUBSCRIPTION_ID = "random_id"
@@ -33,8 +32,7 @@ def client(mock_kafka_bridge, mock_subscription_registry):
     """Create a test client with mocked Kafka bridge and subscription registry."""
     with patch("receiver.PyKafBridge", return_value=mock_kafka_bridge), \
          patch("receiver.subscription_registry", mock_subscription_registry), \
-         patch("receiver.check_producers_thread") as mock_thread:
-        mock_thread.start = MagicMock()
+         patch("receiver.check_producers_life", new_callable=AsyncMock):
         from receiver import app
 
         with TestClient(app) as test_client:
@@ -340,45 +338,37 @@ class TestReceiveEndpoint:
 class TestSubscriptionEndpoints:
     """Tests for subscription management endpoints."""
 
-    @patch("receiver.requests.post")
-    def test_subscribe_to_producer_success(self, mock_requests_post, client, mock_subscription_registry):
+    def test_subscribe_to_producer_success(self, client, mock_subscription_registry):
         """Test successfully subscribing to a producer."""
-        # Mock the response from the producer
+        import receiver
         mock_response = Mock()
-        mock_response.text = json.dumps({"subscription_id": "test-sub-123"})
+        mock_response.json = Mock(return_value={"subscription_id": "test-sub-123", "heartbeat_url": "http://producer-service:8000/heartbeat"})
         mock_response.status_code = 200
-        mock_requests_post.return_value = mock_response
 
         producer_url = "http://producer-service:8000/subscribe"
         payload = {"producer_url": producer_url}
 
-        response = client.post("/subscriptions", json=payload)
+        with patch.object(receiver.http_client, "post", new_callable=AsyncMock, return_value=mock_response):
+            response = client.post("/subscriptions", json=payload)
 
         # Verify the response
         assert response.status_code == 201
         data = response.json()
         assert data["id"] == "test-sub-123"
 
-        # Verify requests.post was called correctly
-        from receiver import HOST, PORT
-        mock_requests_post.assert_called_once_with(
-            producer_url,
-            json={"url": f"http://{HOST}:{PORT}/receive"},
-            timeout=5
-        )
-
         # Verify subscription was added to registry
-        mock_subscription_registry.add.assert_called_once_with("test-sub-123", producer_url)
+        mock_subscription_registry.add.assert_called_once_with("test-sub-123", producer_url, "http://producer-service:8000/heartbeat")
 
-    @patch("receiver.requests.post")
-    def test_subscribe_to_producer_timeout(self, mock_requests_post, client, mock_subscription_registry):
+    def test_subscribe_to_producer_timeout(self, client, mock_subscription_registry):
         """Test subscribing when producer times out."""
-        mock_requests_post.side_effect = requests.exceptions.Timeout()
+        import receiver
+        import httpx
 
         producer_url = "http://producer-service:8000/subscribe"
         payload = {"producer_url": producer_url}
 
-        response = client.post("/subscriptions", json=payload)
+        with patch.object(receiver.http_client, "post", new_callable=AsyncMock, side_effect=httpx.TimeoutException("")):
+            response = client.post("/subscriptions", json=payload)
 
         assert response.status_code == 504
         assert "Producer didnt respond" in response.text
@@ -386,15 +376,16 @@ class TestSubscriptionEndpoints:
         # Verify subscription was not added
         mock_subscription_registry.add.assert_not_called()
 
-    @patch("receiver.requests.post")
-    def test_subscribe_to_producer_connection_error(self, mock_requests_post, client, mock_subscription_registry):
+    def test_subscribe_to_producer_connection_error(self, client, mock_subscription_registry):
         """Test subscribing when cannot connect to producer."""
-        mock_requests_post.side_effect = requests.exceptions.ConnectionError()
+        import receiver
+        import httpx
 
         producer_url = "http://producer-service:8000/subscribe"
         payload = {"producer_url": producer_url}
 
-        response = client.post("/subscriptions", json=payload)
+        with patch.object(receiver.http_client, "post", new_callable=AsyncMock, side_effect=httpx.ConnectError("")):
+            response = client.post("/subscriptions", json=payload)
 
         assert response.status_code == 502
         data = response.json()
@@ -403,18 +394,19 @@ class TestSubscriptionEndpoints:
         # Verify subscription was not added
         mock_subscription_registry.add.assert_not_called()
 
-    @patch("receiver.requests.post")
-    def test_subscribe_to_producer_unexpected_response(self, mock_requests_post, client, mock_subscription_registry):
+    def test_subscribe_to_producer_unexpected_response(self, client, mock_subscription_registry):
         """Test subscribing when producer gives unexpected response."""
+        import receiver
+
         mock_response = Mock()
-        mock_response.text = "invalid json"
+        mock_response.json = Mock(side_effect=ValueError("invalid json"))
         mock_response.status_code = 200
-        mock_requests_post.return_value = mock_response
 
         producer_url = "http://producer-service:8000/subscribe"
         payload = {"producer_url": producer_url}
 
-        response = client.post("/subscriptions", json=payload)
+        with patch.object(receiver.http_client, "post", new_callable=AsyncMock, return_value=mock_response):
+            response = client.post("/subscriptions", json=payload)
 
         assert response.status_code == 500
         data = response.json()
@@ -455,48 +447,50 @@ class TestSubscriptionEndpoints:
         assert "sub-2" in producer_ids
         assert "sub-3" in producer_ids
 
-    @patch("receiver.requests.delete")
-    def test_unsubscribe_success(self, mock_requests_delete, client, mock_subscription_registry):
+    def test_unsubscribe_success(self, client, mock_subscription_registry):
         """Test successfully unsubscribing from a producer."""
+        import receiver
+
         subscription_id = "test-sub-123"
         producer_url = "http://producer-service:8000/subscribe"
-        
+
         mock_subscription_registry.get_url.return_value = producer_url
-        
+
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_requests_delete.return_value = mock_response
 
-        response = client.delete(f"/subscriptions/{subscription_id}")
+        with patch.object(receiver.http_client, "delete", new_callable=AsyncMock, return_value=mock_response) as mock_delete:
+            response = client.delete(f"/subscriptions/{subscription_id}")
 
-        assert response.status_code == 200
-        data = response.json()
-        assert data["subscription_id"] == subscription_id
+            assert response.status_code == 200
+            data = response.json()
+            assert data["subscription_id"] == subscription_id
 
-        # Verify requests.delete was called correctly
-        mock_requests_delete.assert_called_once_with(f"{producer_url}/{subscription_id}")
+            # Verify http_client.delete was called correctly
+            mock_delete.assert_called_once_with(f"{producer_url}/{subscription_id}")
 
         # Verify subscription was removed from registry
         mock_subscription_registry.remove.assert_called_once_with(subscription_id)
 
-    @patch("receiver.requests.delete")
-    def test_unsubscribe_with_trailing_slash(self, mock_requests_delete, client, mock_subscription_registry):
+    def test_unsubscribe_with_trailing_slash(self, client, mock_subscription_registry):
         """Test unsubscribing when producer URL has trailing slash."""
+        import receiver
+
         subscription_id = "test-sub-123"
         producer_url = "http://producer-service:8000/subscribe/"
-        
+
         mock_subscription_registry.get_url.return_value = producer_url
-        
+
         mock_response = Mock()
         mock_response.status_code = 200
-        mock_requests_delete.return_value = mock_response
 
-        response = client.delete(f"/subscriptions/{subscription_id}")
+        with patch.object(receiver.http_client, "delete", new_callable=AsyncMock, return_value=mock_response) as mock_delete:
+            response = client.delete(f"/subscriptions/{subscription_id}")
 
-        assert response.status_code == 200
+            assert response.status_code == 200
 
-        # Verify trailing slash was removed in the request
-        mock_requests_delete.assert_called_once_with(f"http://producer-service:8000/subscribe/{subscription_id}")
+            # Verify trailing slash was removed in the request
+            mock_delete.assert_called_once_with(f"http://producer-service:8000/subscribe/{subscription_id}")
 
     def test_unsubscribe_not_found(self, client, mock_subscription_registry):
         """Test unsubscribing from non-existent subscription."""
@@ -509,20 +503,21 @@ class TestSubscriptionEndpoints:
         data = response.json()
         assert "Subscription not found" in data["detail"]
 
-    @patch("receiver.requests.delete")
-    def test_unsubscribe_producer_error(self, mock_requests_delete, client, mock_subscription_registry):
+    def test_unsubscribe_producer_error(self, client, mock_subscription_registry):
         """Test unsubscribing when producer returns error."""
+        import receiver
+
         subscription_id = "test-sub-123"
         producer_url = "http://producer-service:8000/subscribe"
-        
+
         mock_subscription_registry.get_url.return_value = producer_url
-        
+
         mock_response = Mock()
         mock_response.status_code = 404
         mock_response.text = "Subscription not found on producer"
-        mock_requests_delete.return_value = mock_response
 
-        response = client.delete(f"/subscriptions/{subscription_id}")
+        with patch.object(receiver.http_client, "delete", new_callable=AsyncMock, return_value=mock_response):
+            response = client.delete(f"/subscriptions/{subscription_id}")
 
         assert response.status_code == 404
         data = response.json()
