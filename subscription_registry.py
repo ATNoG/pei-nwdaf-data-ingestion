@@ -102,7 +102,7 @@ class SubscriptionRegistry:
     def record_failure(self, id : str):
         with self.lock:
             self.producers_failures[id] += 1
-            if self.producers_failures > self.max_failures:
+            if self.producers_failures[id] > self.max_failures:
                 self.producers_active[id] = False
 
     def record_success(self, id : str):
