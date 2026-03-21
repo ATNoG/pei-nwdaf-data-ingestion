@@ -57,11 +57,11 @@ subscription_registry = SubscriptionRegistry()
 async def check_producers_life(subscription_registry : SubscriptionRegistry):
     logger.info("Checking producers")
     while True:
-        producers = subscription_registry.get_all_producers()
+        producers = subscription_registry.get_all_active_producers()
         for prod in producers:
             heartbeat_url = subscription_registry.get_heartbeat_url(prod)
             try:
-                response = await http_client.post(heartbeat_url)
+                response = await http_client.get(heartbeat_url)
                 if response.status_code == 202:
                     subscription_registry.record_success(prod)
                 else:
@@ -263,7 +263,7 @@ async def get_subscriptions():
     {"producers" : [{sub_id : {url, label, active}}, {sub_id : {url, label, active}}]}
     """
     producers_with_labels = subscription_registry.get_all_with_labels()
-    producers_list = [{sub_id: {"url": info["url"], "label": info["label"], "active" : info["active"]}} for sub_id, info in producers_with_labels.items()]
+    producers_list = [{sub_id: {"url": info["url"], "label": info["label"]}} for sub_id, info in producers_with_labels.items()]
     return {"producers": producers_list}   
 
 @app.put("/subscriptions/{subscription_id}/label")

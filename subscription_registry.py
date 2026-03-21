@@ -57,15 +57,19 @@ class SubscriptionRegistry:
                 sub_id: {
                     "url": url,
                     "label": self.producers_labels.get(sub_id, sub_id),
-                    "active" : self.producers_active[sub_id]
                 }
-                for sub_id, url in self.producers.items()
+                for sub_id, url in self.producers.items() if self.producers_active[sub_id]
             }
 
-    def get_all_producers(self) -> Dict[str, str]:
-        """Return all producers as {subscription_id: url}."""
+    def get_all_active_producers(self) -> List[str]:
+        """Return all producers as [id, id, id]."""
+        active = []
         with self.lock:
-            return self.producers.copy()
+            for prod in self.producers:
+                if self.producers_active[prod]:
+                    active.append(prod)
+
+        return active
 
     def get_all_with_status(self) -> Dict[str, list]:  # no timeout param needed
         with self.lock:
