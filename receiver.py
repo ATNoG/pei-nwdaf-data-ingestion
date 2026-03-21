@@ -62,7 +62,7 @@ async def check_producers_life(subscription_registry : SubscriptionRegistry):
             heartbeat_url = subscription_registry.get_heartbeat_url(prod)
             try:
                 response = await http_client.get(heartbeat_url)
-                if response.status_code == 202:
+                if response.status_code == 200:
                     subscription_registry.record_success(prod)
                 else:
                     logger.warning(f"Producer {prod} returned unexpected status {response.status_code}")
