@@ -55,8 +55,21 @@ PRODUCER_MAX_TIME_OUT = int(os.getenv("PRODUCER_MAX_TIMEOUT", 30))
 
 subscription_registry = SubscriptionRegistry()
 async def check_producers_life(subscription_registry : SubscriptionRegistry):
+    logger.info("Checking producers")
     while True:
-        subscription_registry.update_producers_life(PRODUCER_MAX_TIME_OUT)
+        producers = subscription_registry.get_all_producers()
+        for prod in producers:
+            heartbeat_url = subscription_registry.get_heartbeat_url(prod)
+            try:
+                response = await http_client.post(heartbeat_url)
+                if response.status_code == 202:
+                    subscription_registry.record_success(prod)
+                else:
+                    logger.warning(f"Producer {prod} returned unexpected status {response.status_code}")
+                    subscription_registry.record_failure(prod)
+            except Exception as e:
+                logger.warning(f"Producer {prod} heartbeat failed: {e}")
+                subscription_registry.record_failure(prod)
         logger.info("Checking producers")
         await asyncio.sleep(5)
 
@@ -227,14 +240,15 @@ async def subscribe_to_producer(request : SubscribeRequest):
         response = await http_client.post(request.producer_url, json=request_to_producer)
         response_json = response.json()
         id = response_json["subscription_id"]
-        subscription_registry.add(id, request.producer_url)
+        heartbeat_url = response_json["heartbeat_url"]
+        subscription_registry.add(id, request.producer_url, heartbeat_url)
         logger.info(f"Producer {request.producer_url} added with subscription id: {id}")
         return {"id" : id}
-    except httpx.exceptions.Timeout:
+    except httpx.TimeoutException:
         logger.warning(f"Producer {request.producer_url} didnt respond")
         raise HTTPException(status_code=504, detail="Producer didnt respond")
 
-    except httpx.exceptions.ConnectionError:
+    except httpx.ConnectError:
         logger.warning(f"Cannot connect to producer {request.producer_url}")
         raise HTTPException(status_code=502, detail="Cannot connect to producer")
     except:

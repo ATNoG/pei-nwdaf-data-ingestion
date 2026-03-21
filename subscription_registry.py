@@ -8,16 +8,17 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class SubscriptionRegistry:
-    def __init__(self):
+    def __init__(self, max_failures : int = 10):
         self.producers: Dict[str, str] = {}
         self.producers_failures : Dict[str, int] = {}
         self.producers_last_info : Dict[str, int] = {}
         self.producers_labels: Dict[str, str] = {}  # subscription_id -> label
         self.producers_active : Dict[str, bool] = {}
-        
+        self.producers_heartbeat_url : Dict[str, str] = {}       
+        self.max_failures = max_failures
         self.lock = threading.Lock()
 
-    def add(self, subscription_id, url: str):
+    def add(self, subscription_id, url: str, heartbeal_url : str):
         with self.lock:
             self.producers[subscription_id] = url
             self.producers_failures[subscription_id] = 0
@@ -25,6 +26,7 @@ class SubscriptionRegistry:
             # Default label is subscription_id
             self.producers_labels[subscription_id] = subscription_id
             self.producers_active[subscription_id] = True
+            self.producers_heartbeat_url[subscription_id] = heartbeal_url
 
     def remove(self, sub_id: str):
         with self.lock:
@@ -33,6 +35,7 @@ class SubscriptionRegistry:
             self.producers_last_info.pop(sub_id, None)
             self.producers_labels.pop(sub_id, None)
             self.producers_active.pop(sub_id, None)
+            self.producers_heartbeat_url.pop(sub_id, None)
 
     def set_label(self, subscription_id: str, label: str) -> bool:
         """Update or set a producer's label. Returns True if producer exists."""
@@ -82,6 +85,9 @@ class SubscriptionRegistry:
 
     def get_url(self, id : str) -> str:
         return self.producers[id]
+    
+    def get_heartbeat_url(self, id : str) -> str:
+        return self.producers_heartbeat_url[id]
 
     def received_data(self, id : str):
         now = int(time.time())
@@ -92,21 +98,15 @@ class SubscriptionRegistry:
             if self.producers_active[id] is False:
                 self.producers_active[id] = True
             self.producers_last_info[id] = now
-
-    def update_producers_life(self, timeout : int):
-        to_inactive = []
+    
+    def record_failure(self, id : str):
         with self.lock:
-            producers = self.producers
-            now = int(time.time())
-            for producer in producers:
-                last_info = self.producers_last_info[producer]
-                if now - last_info > timeout:
-                    to_inactive.append(producer)
-                    logger.info(f"Producer {producer} is considered inactive for timeout")
+            self.producers_failures[id] += 1
+            if self.producers_failures > self.max_failures:
+                self.producers_active[id] = False
 
-        for prod_remove in to_inactive:
-            self._to_inactive(prod_remove)
-
-    def _to_inactive(self, producer_id : str):
+    def record_success(self, id : str):
         with self.lock:
-            self.producers_active[producer_id] = False
+            self.producers_failures[id] = 0
+            self.producers_active[id] = True
+
