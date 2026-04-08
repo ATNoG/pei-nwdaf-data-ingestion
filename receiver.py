@@ -161,28 +161,32 @@ async def lifespan(app: FastAPI):
     global kafka_bridge, policy_client
     kafka_bridge = PyKafBridge(TOPIC, hostname=KAFKA_HOST, port=KAFKA_PORT)
 
-    try:
-        # Use discovered fields if available (e.g. from a previous run still in
-        # memory), otherwise seed with REQUIRED_FIELDS so the policy service
-        # always knows at least about the mandatory columns.
-        startup_columns = list(_discovered_fields) if _discovered_fields else list(REQUIRED_FIELDS)
-        await policy_client.register_component(
-            component_type="ingestion",
-            role=os.getenv("POLICY_ROLENAME", "Ingestion"),
-            data_columns=startup_columns,
-            allowed_fields=build_allowed_fields(),  # Producer categories
-            auto_create_attributes=True
-        )
-        logger.info(f"Component registered with Policy Service ({len(startup_columns)} fields)")
-        # Keep registration alive across Policy restarts
-        await policy_client.start_heartbeat()
-    except Exception as e:
-        logger.warning(f"Failed to register with Policy Service: {e}")
+    if POLICY_ENABLED:
+        try:
+            # Use discovered fields if available (e.g. from a previous run still in
+            # memory), otherwise seed with REQUIRED_FIELDS so the policy service
+            # always knows at least about the mandatory columns.
+            startup_columns = list(_discovered_fields) if _discovered_fields else list(REQUIRED_FIELDS)
+            await policy_client.register_component(
+                component_type="ingestion",
+                role=os.getenv("POLICY_ROLENAME", "Ingestion"),
+                data_columns=startup_columns,
+                allowed_fields=build_allowed_fields(),  # Producer categories
+                auto_create_attributes=True
+            )
+            logger.info(f"Component registered with Policy Service ({len(startup_columns)} fields)")
+            # Keep registration alive across Policy restarts
+            await policy_client.start_heartbeat()
+        except Exception as e:
+            logger.warning(f"Failed to register with Policy Service: {e}")
+    else:
+        logger.info("Policy enforcement disabled, skipping registration")
 
     yield
 
     # Shutdown
-    await policy_client.stop_heartbeat()
+    if POLICY_ENABLED:
+        await policy_client.stop_heartbeat()
     await kafka_bridge.close()
 
 
@@ -220,6 +224,21 @@ async def subscribe_to_producer(request : SubscribeRequest):
         id = response_json["subscription_id"]
         subscription_registry.add(id, request.producer_url)
         logger.info(f"Producer {request.producer_url} added with subscription id: {id}")
+
+        # Re-register with Policy so the new producer appears in allowed_fields
+        if POLICY_ENABLED:
+            try:
+                await policy_client.register_component(
+                    component_type="ingestion",
+                    role=os.getenv("POLICY_ROLENAME", "Ingestion"),
+                    data_columns=list(_discovered_fields) if _discovered_fields else list(REQUIRED_FIELDS),
+                    allowed_fields=build_allowed_fields(),
+                    auto_create_attributes=False
+                )
+                logger.info(f"Updated Policy registration after adding producer {id}")
+            except Exception as e:
+                logger.warning(f"Failed to update Policy registration after adding producer: {e}")
+
         return {"id" : id}
     except requests.exceptions.Timeout:
         logger.warning(f"Producer {request.producer_url} didnt respond")
@@ -264,16 +283,17 @@ async def set_producer_label(subscription_id: str, label_data: dict):
         raise HTTPException(status_code=404, detail="Producer not found")
 
     # Re-register with Policy to update allowed_fields with new labels
-    try:
-        await policy_client.register_component(
-            component_type="ingestion",
-            role=os.getenv("POLICY_ROLENAME", "Ingestion"),
-            data_columns=list(_discovered_fields),
-            allowed_fields=build_allowed_fields(),  # Update with new label
-            auto_create_attributes=False  # Don't recreate attributes
-        )
-    except Exception as e:
-        logger.warning(f"Failed to update Policy registration after label change: {e}")
+    if POLICY_ENABLED:
+        try:
+            await policy_client.register_component(
+                component_type="ingestion",
+                role=os.getenv("POLICY_ROLENAME", "Ingestion"),
+                data_columns=list(_discovered_fields),
+                allowed_fields=build_allowed_fields(),  # Update with new label
+                auto_create_attributes=False  # Don't recreate attributes
+            )
+        except Exception as e:
+            logger.warning(f"Failed to update Policy registration after label change: {e}")
 
     return {"subscription_id": subscription_id, "label": label}
 
@@ -286,9 +306,24 @@ async def unsubscrive_to_producer(subscription_id : str):
         response = requests.delete(f"{url}/{subscription_id}")
         if response.status_code == 200:
             subscription_registry.remove(subscription_id)
+
+            # Re-register with Policy to update allowed_fields (remove stale producer)
+            if POLICY_ENABLED:
+                try:
+                    await policy_client.register_component(
+                        component_type="ingestion",
+                        role=os.getenv("POLICY_ROLENAME", "Ingestion"),
+                        data_columns=list(_discovered_fields),
+                        allowed_fields=build_allowed_fields(),  # Updated without removed producer
+                        auto_create_attributes=False
+                    )
+                    logger.info(f"Re-registered with Policy after removing producer {subscription_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to update Policy registration after removing producer: {e}")
+
             return {"subscription_id" : subscription_id}
         else:
-            raise HTTPException(status_code=response.status_code, detail=response.text)     
+            raise HTTPException(status_code=response.status_code, detail=response.text)
     except KeyError:
         raise HTTPException(status_code=404, detail="Subscription not found")
     except HTTPException:
@@ -303,10 +338,6 @@ async def receive_data(request: Request):
     For any REQUIRED_FIELDS key missing from the incoming packet, the
     returned value will be None.
     """
-
-    # Use the component_id as the source for policy checks when writing to Kafka
-    # The external client sending data is irrelevant - we (ingestion-service) are the source
-    source_id = POLICY_COMPONENT_ID
 
     payload = await request.json()
     data = payload or {}
@@ -324,6 +355,12 @@ async def receive_data(request: Request):
         raise HTTPException(status_code=400, detail="Bad request")
     except HTTPException:
         raise
+
+    # Build source_id with producer subcategory for pipeline lookup
+    # Format: "ingestion-service:{label}" matches frontend-created pipeline IDs
+    producer_label = subscription_registry.get_label(id)
+    source_id = f"{POLICY_COMPONENT_ID}:{producer_label}"
+    sink_id = os.getenv("POLICY_SINK_ID", "kafka")
 
     logger.info(f"DEBUG: receive_data called, keys: {list(data.keys()) if isinstance(data, dict) else 'not dict'}")
     results = []
@@ -351,7 +388,7 @@ async def receive_data(request: Request):
                 logger.info(f"First data received! Discovered {len(_discovered_fields)} fields: {list(_discovered_fields)}")
 
             # If new fields were discovered, re-register with Policy Service
-            if len(_discovered_fields) > previous_field_count:
+            if POLICY_ENABLED and len(_discovered_fields) > previous_field_count:
                 logger.info(f"New fields discovered! Total: {len(_discovered_fields)}. Re-registering...")
                 try:
                     await policy_client.register_component(
@@ -383,7 +420,7 @@ async def receive_data(request: Request):
 
             result = await policy_client.process_data(
                 source_id=source_id,
-                sink_id="kafka",
+                sink_id=sink_id,
                 data=record,
                 action="write"
             )
@@ -391,6 +428,9 @@ async def receive_data(request: Request):
             if not result.allowed:
                 logger.warning(f"Data filtered by policy: {result.reason}")
                 continue
+
+            # Debug: log transformed data to verify hashing is working
+            logger.info(f"Policy result - data: {result.data}, transformations: {result.transformations}")
 
             results.append({"status": "ok", "data": result.data})
 
@@ -415,27 +455,36 @@ async def receive_data(request: Request):
 
         return {"results": results}
 
-    # Fallback
+    # Fallback (single record, no analyticsData wrapper)
     missing = REQUIRED_FIELDS - data.keys()
     if missing or any(data.get(f) is None for f in REQUIRED_FIELDS):
         return {
             "status": "error",
             "message": f"Missing mandatory fields: {missing or REQUIRED_FIELDS}",
         }
-    message = json.dumps(data)  # Send to Kafka if available
+
     if kafka_bridge is None:
-        print("Kafka bridge not available - skipping produce")
         return {"status": "no-kafka", "data": data}
 
+    result = await policy_client.process_data(
+        source_id=source_id,
+        sink_id=sink_id,
+        data=data,
+        action="write"
+    )
+
+    if not result.allowed:
+        return {"status": "error", "message": f"Blocked by policy: {result.reason}"}
+
+    message = json.dumps(result.data)
     try:
         success = kafka_bridge.produce(TOPIC, message)
     except Exception:
         success = False
 
     if success:
-        # Broadcast to WebSocket clients
-        asyncio.create_task(manager.broadcast(id,{"type": "data_ingested", "data": data}))
-        return {"status": "ok", "data": data}
+        asyncio.create_task(manager.broadcast(id, {"type": "data_ingested", "data": result.data}))
+        return {"status": "ok", "data": result.data}
     else:
         return {"status": "error", "message": "Failed to send to Kafka"}
 
