@@ -2,25 +2,26 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
-import threading
-import requests
-from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Dict, Set
 
-from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, HTTPException
+import requests
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from utils.kmw import PyKafBridge
 
 from policy_client import PolicyClient
-from subscription_registry import SubscriptionRegistry
+from registry import NfRegistry
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Kafka setup
+# ── Config ────────────────────────────────────────────────────────────────────
+
 KAFKA_HOST = os.getenv("KAFKA_HOST", "localhost")
 KAFKA_PORT = os.getenv("KAFKA_PORT", "9092")
 TOPIC = os.getenv("KAFKA_TOPIC", "network.data.ingested")
@@ -29,447 +30,416 @@ POLICY_SERVICE_URL = os.getenv("POLICY_SERVICE_URL", "http://policy-service:8788
 POLICY_COMPONENT_ID = os.getenv("POLICY_COMPONENT_ID", "ingestion-service")
 POLICY_ENABLED = os.getenv("POLICY_ENABLED", "false").lower() == "true"
 
-# Track all fields seen from incoming data
+HOST = os.getenv("HOST", "data-ingestion")
+PORT = int(os.getenv("PORT", "7000"))
+
+REGISTRY_DB = os.getenv("REGISTRY_DB", "registry.db")
+
+# Tracks metric field names discovered from incoming NEF data (for Policy registration)
 _discovered_fields: set[str] = set()
 
 
 def get_discovered_fields() -> list[str]:
-    """Get all field names discovered from incoming data."""
     return list(_discovered_fields)
 
 
 policy_client = PolicyClient(
     service_url=POLICY_SERVICE_URL,
     component_id=POLICY_COMPONENT_ID,
-    fields=get_discovered_fields,  # Function to get dynamic fields
-    enable_policy=POLICY_ENABLED,
+    fields=get_discovered_fields,
+    enable_policy=True,
     heartbeat_interval=30,
-)
+) if POLICY_ENABLED else None
 
-REQUIRED_FIELDS = {"timestamp", "cell_index"}
-
-# Subscribe
-HOST = os.getenv("HOST", "data-ingestion")
-PORT = os.getenv("PORT", 7000)
-PRODUCER_MAX_TIME_OUT = int(os.getenv("PRODUCER_MAX_TIMEOUT", 30))
-
-
-subscription_registry = SubscriptionRegistry(max_failures=5)
-#initialize thread to check producers
-def check_producers_life(subscription_registry : SubscriptionRegistry):
-    while True:
-        subscription_registry.update_producers_life(PRODUCER_MAX_TIME_OUT)
-        logger.info("Checking producers")
-        time.sleep(5)
-
-
-check_producers_thread = threading.Thread(target=check_producers_life, args=(subscription_registry,), daemon=True)
-check_producers_thread.start()
-
-raw_data_store = deque(maxlen=1000)  # Store last 1000 entries
+nf_registry = NfRegistry(db_path=REGISTRY_DB)
 kafka_bridge = None
 
+# ── Parsers ───────────────────────────────────────────────────────────────────
 
-def build_allowed_fields() -> dict:
-    """
-    Build allowed_fields dict with producer categories for Policy registration.
-
-    Returns:
-        {
-            "ingestion-service:{subscription_id}": [fields],
-            "ingestion-service:{label}": [fields],
-        }
-    """
-    producers = subscription_registry.get_all_with_labels()
-    allowed_fields = {}
-
-    # Use discovered fields for all producers (they share the same schema).
-    # Fall back to REQUIRED_FIELDS so that allowed_fields entries are never
-    # empty lists — an empty list causes the policy service's field discovery
-    # to return zero fields (no fallback to data_columns when keys exist).
-    fields_list = list(_discovered_fields) if _discovered_fields else list(REQUIRED_FIELDS)
-
-    for sub_id, info in producers.items():
-
-        # Add with subscription_id as key
-        allowed_fields[f"ingestion-service:{sub_id}"] = fields_list
-
-        # Also add with label as key (if different from sub_id)
-        label = info["label"]
-        if label != sub_id:
-            allowed_fields[f"ingestion-service:{label}"] = fields_list
-
-        # Also add with sanitized URL as key for readability
-        url = info["url"]
-        if url:
-            safe_url = url.replace("://", "_").replace("/", "_").replace(":", "_")
-            safe_url = safe_url.strip("_")[:30]  # Limit length
-            if safe_url:
-                allowed_fields[f"ingestion-service:{safe_url}"] = fields_list
-
-    return allowed_fields
+_BITRATE_RE = re.compile(r"^(\d+\.?\d*)\s*(bps|Kbps|Mbps|Gbps|Tbps)$")
+_BITRATE_MUL = {"bps": 1e-6, "Kbps": 1e-3, "Mbps": 1.0, "Gbps": 1e3, "Tbps": 1e6}
 
 
-# WebSocket connection manager
+def parse_bitrate_mbps(value: str) -> float | None:
+    """Parse a 3GPP BitRate string to Mbps. Returns None if unparseable."""
+    m = _BITRATE_RE.match(value.strip())
+    if not m:
+        return None
+    return round(float(m.group(1)) * _BITRATE_MUL[m.group(2)], 6)
+
+
+def parse_datetime_to_unix(value: str) -> int | None:
+    """Parse an ISO 8601 datetime string to a Unix timestamp. Returns None on failure."""
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+# ── NEF event normalizers ─────────────────────────────────────────────────────
+
+def _normalize_perf_data(info: dict, context_tags: dict) -> dict | None:
+    tags = dict(context_tags)
+
+    ue_ip = info.get("ueIpAddr") or {}
+    if ue_ip.get("ipv4Addr"):
+        tags["ueIpv4Addr"] = ue_ip["ipv4Addr"]
+    elif ue_ip.get("ipv6Addr"):
+        tags["ueIpv6Addr"] = ue_ip["ipv6Addr"]
+    if info.get("appId"):
+        tags["appId"] = info["appId"]
+
+    if not tags:
+        return None
+
+    perf = info.get("perfData") or {}
+    metrics: dict[str, Any] = {}
+
+    for src, dst in [
+        ("thrputUl", "thrputUl_mbps"), ("thrputDl", "thrputDl_mbps"),
+        ("maxThrputUl", "maxThrputUl_mbps"), ("minThrputUl", "minThrputUl_mbps"),
+        ("maxThrputDl", "maxThrputDl_mbps"), ("minThrputDl", "minThrputDl_mbps"),
+    ]:
+        val = perf.get(src)
+        if val is not None:
+            parsed = parse_bitrate_mbps(str(val))
+            if parsed is not None:
+                metrics[dst] = parsed
+
+    for src, dst in [
+        ("pdb", "pdb_ms"), ("pdbDl", "pdbDl_ms"),
+        ("maxPdbUl", "maxPdbUl_ms"), ("maxPdbDl", "maxPdbDl_ms"),
+        ("plr", "plr_per_thousand"), ("plrDl", "plrDl_per_thousand"),
+        ("maxPlrUl", "maxPlrUl_per_thousand"), ("maxPlrDl", "maxPlrDl_per_thousand"),
+    ]:
+        val = perf.get(src)
+        if val is not None:
+            metrics[dst] = int(val)
+
+    ts_str = info.get("timeStamp")
+    timestamp = parse_datetime_to_unix(ts_str) if ts_str else int(time.time())
+
+    return {
+        "timestamp": timestamp or int(time.time()),
+        "tags": tags,
+        "event": "PERF_DATA",
+        "metrics": metrics,
+    }
+
+
+def _normalize_ue_mobility(info: dict, context_tags: dict) -> dict | None:
+    tags = dict(context_tags)
+    if info.get("supi"):
+        tags["supi"] = info["supi"]
+    if info.get("gpsi"):
+        tags["gpsi"] = info["gpsi"]
+
+    if not tags:
+        return None
+
+    trajectory = []
+    for traj in info.get("ueTrajs") or []:
+        ts = parse_datetime_to_unix(traj["ts"]) if traj.get("ts") else None
+        nr = (traj.get("location") or {}).get("nrLocation") or {}
+        trajectory.append({
+            "ts": ts,
+            "tac": (nr.get("tai") or {}).get("tac"),
+            "nrCellId": (nr.get("ncgi") or {}).get("nrCellId"),
+        })
+
+    timestamp = trajectory[0]["ts"] if trajectory and trajectory[0].get("ts") else int(time.time())
+
+    return {
+        "timestamp": timestamp or int(time.time()),
+        "tags": tags,
+        "event": "UE_MOBILITY",
+        "metrics": {"trajectory": trajectory},
+    }
+
+
+def _normalize_ue_comm(info: dict, context_tags: dict) -> dict | None:
+    tags = dict(context_tags)
+    if info.get("supi"):
+        tags["supi"] = info["supi"]
+    if info.get("interGroupId"):
+        tags["interGroupId"] = info["interGroupId"]
+    if info.get("gpsi"):
+        tags["gpsi"] = info["gpsi"]
+
+    if not tags:
+        return None
+
+    comms = []
+    for comm in info.get("comms") or []:
+        comms.append({
+            "startTime": parse_datetime_to_unix(comm["startTime"]) if comm.get("startTime") else None,
+            "endTime": parse_datetime_to_unix(comm["endTime"]) if comm.get("endTime") else None,
+            "ulVol": comm.get("ulVol"),
+            "dlVol": comm.get("dlVol"),
+        })
+
+    timestamp = comms[0]["endTime"] if comms and comms[0].get("endTime") else int(time.time())
+
+    return {
+        "timestamp": timestamp,
+        "tags": tags,
+        "event": "UE_COMM",
+        "metrics": {"comms": comms},
+    }
+
+
+_EVENT_NORMALIZERS: dict[str, tuple[str, Any]] = {
+    "PERF_DATA":    ("perfDataInfos",    _normalize_perf_data),
+    "UE_MOBILITY":  ("ueMobilityInfos",  _normalize_ue_mobility),
+    "UE_COMM":      ("ueCommInfos",      _normalize_ue_comm),
+}
+
+# ── WebSocket manager ─────────────────────────────────────────────────────────
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[str, Set[WebSocket]] = {}
         self._lock = asyncio.Lock()
 
-    async def connect(self, websocket: WebSocket, subscription_id : str):
+    async def connect(self, websocket: WebSocket, notif_id: str):
         await websocket.accept()
         async with self._lock:
-            if subscription_id not in self.active_connections:
-                self.active_connections[subscription_id] = set()
-            self.active_connections[subscription_id].add(websocket)
-        logger.info(f"WebSocket connected for producer {subscription_id}. Total connections: {len(self.active_connections)}")
+            if notif_id not in self.active_connections:
+                self.active_connections[notif_id] = set()
+            self.active_connections[notif_id].add(websocket)
+        logger.info(f"WebSocket connected for notifId={notif_id}")
 
     async def disconnect(self, websocket: WebSocket):
         async with self._lock:
-            for producer_id, connections in self.active_connections.items():
+            for nid, connections in self.active_connections.items():
                 if websocket in connections:
                     connections.discard(websocket)
-                    logger.info(f"WebSocket disconnected from producer {producer_id}. Remaining: {len(connections)}")
                     break
 
-    async def broadcast(self, subscription_id : str, message: dict):
-        """Broadcast message to all connected clients"""
+    async def broadcast(self, notif_id: str, message: dict):
         disconnected = set()
-
         async with self._lock:
-            connections = self.active_connections.get(subscription_id, set()).copy()
-
-        for connection in connections:
+            connections = self.active_connections.get(notif_id, set()).copy()
+        for conn in connections:
             try:
-                await connection.send_json(message)
+                await conn.send_json(message)
             except Exception as e:
-                logger.error(f"Error broadcasting to client: {e}")
-                disconnected.add(connection)
-
+                logger.error(f"WebSocket broadcast error: {e}")
+                disconnected.add(conn)
         if disconnected:
             async with self._lock:
-                self.active_connections[subscription_id] -= disconnected
+                self.active_connections[notif_id] -= disconnected
 
 
 manager = ConnectionManager()
 
+# ── App lifecycle ─────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-
-    # Startup: Start Kafka bridge
-    global kafka_bridge, policy_client
+    global kafka_bridge
     kafka_bridge = PyKafBridge(TOPIC, hostname=KAFKA_HOST, port=KAFKA_PORT)
-
-    try:
-        # Use discovered fields if available (e.g. from a previous run still in
-        # memory), otherwise seed with REQUIRED_FIELDS so the policy service
-        # always knows at least about the mandatory columns.
-        startup_columns = list(_discovered_fields) if _discovered_fields else list(REQUIRED_FIELDS)
-        await policy_client.register_component(
-            component_type="ingestion",
-            role=os.getenv("POLICY_ROLENAME", "Ingestion"),
-            data_columns=startup_columns,
-            allowed_fields=build_allowed_fields(),  # Producer categories
-            auto_create_attributes=True
-        )
-        logger.info(f"Component registered with Policy Service ({len(startup_columns)} fields)")
-        # Keep registration alive across Policy restarts
-        await policy_client.start_heartbeat()
-    except Exception as e:
-        logger.warning(f"Failed to register with Policy Service: {e}")
-
+    if policy_client is not None:
+        try:
+            await policy_client.register_component(
+                component_type="ingestion",
+                role=os.getenv("POLICY_ROLENAME", "Ingestion"),
+                data_columns=list(_discovered_fields) or ["timestamp", "tags", "event", "metrics"],
+                allowed_fields={},
+                auto_create_attributes=True,
+            )
+            await policy_client.start_heartbeat()
+            logger.info("Registered with Policy Service")
+        except Exception as e:
+            logger.warning(f"Failed to register with Policy Service: {e}")
     yield
+    if policy_client is not None:
+        await policy_client.stop_heartbeat()
+    try:
+        await kafka_bridge.close()
+    except Exception as e:
+        logger.warning(f"Error closing Kafka bridge: {e}")
 
-    # Shutdown
-    await policy_client.stop_heartbeat()
-    await kafka_bridge.close()
 
-
-# Initialize FastAPI app
 app = FastAPI(lifespan=lifespan)
 
-# CORS middleware
 origins = os.getenv("CORS_ORIGINS", "")
 allowed_origins = [o.strip() for o in origins.split(",") if o.strip()]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["*"],  # Allows GET, POST, etc.
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
+# ── Pydantic models ───────────────────────────────────────────────────────────
 
-# Can be expanded later
-class DataPacket(BaseModel):
-    data: Dict[str, Any]
+class NefSubscriptionRequest(BaseModel):
+    notifId: str
+    nefUrl: str
+    events: list[str]
+    snssai: dict | None = None
+    dnn: str | None = None
 
-class SubscribeRequest(BaseModel):
-    producer_url : str
+# ── NEF endpoints ─────────────────────────────────────────────────────────────
 
-# Fields to extract and send to Kafka (can be expanded later)
-
-
-@app.post("/subscriptions", status_code=201)
-async def subscribe_to_producer(request : SubscribeRequest):
+@app.post("/nef/subscriptions", status_code=201)
+async def create_nef_subscription(body: NefSubscriptionRequest):
+    """Subscribe to a NEF and store the subscription context."""
+    nef_payload = {
+        "notifId": body.notifId,
+        "notifUri": f"http://{HOST}:{PORT}/nef/notify",
+        "eventsSubs": [{"event": e} for e in body.events],
+    }
+    loop = asyncio.get_running_loop()
     try:
-        response = requests.post(request.producer_url, json={"url" : f"http://{HOST}:{PORT}/receive"}, timeout=5)
-        response_json =json.loads(response.text)
-        id = response_json["subscription_id"]
-        subscription_registry.add(id, request.producer_url)
-        logger.info(f"Producer {request.producer_url} added with subscription id: {id}")
-        return {"id" : id}
-    except requests.exceptions.Timeout:
-        logger.warning(f"Producer {request.producer_url} didnt respond")
-        raise HTTPException(status_code=504, detail="Producer didnt respond")
-
-    except requests.exceptions.ConnectionError:
-        logger.warning(f"Cannot connect to producer {request.producer_url}")
-        raise HTTPException(status_code=502, detail="Cannot connect to producer")
-    except:
-        logger.warning(f"Producer {request.producer_url} gave unexpected answer")
-        raise HTTPException(status_code=500, detail="Producer gave unexpected answer")
-
-@app.get("/subscriptions")
-async def get_subscriptions():
-    """
-    Returns all producers in the system with their labels.
-    Returns in this format:
-    {"producers" : [{sub_id : {url, label}}, {sub_id : {url, label}}]}
-    """
-    producers_with_labels = subscription_registry.get_all_with_labels()
-    producers_list = [{sub_id: {"url": info["url"], "label": info["label"]}} for sub_id, info in producers_with_labels.items()]
-    return {"producers": producers_list}   
-
-@app.put("/subscriptions/{subscription_id}/label")
-async def set_producer_label(subscription_id: str, label_data: dict):
-    """
-    Set a custom label for a producer.
-
-    Args:
-        subscription_id: The producer's subscription ID
-        label_data: {"label": "custom_label"}
-
-    Returns:
-        {"subscription_id": str, "label": str}
-    """
-    label = label_data.get("label", "").strip()
-    if not label:
-        raise HTTPException(status_code=400, detail="Label cannot be empty")
-
-    success = subscription_registry.set_label(subscription_id, label)
-    if not success:
-        raise HTTPException(status_code=404, detail="Producer not found")
-
-    # Re-register with Policy to update allowed_fields with new labels
-    try:
-        await policy_client.register_component(
-            component_type="ingestion",
-            role=os.getenv("POLICY_ROLENAME", "Ingestion"),
-            data_columns=list(_discovered_fields),
-            allowed_fields=build_allowed_fields(),  # Update with new label
-            auto_create_attributes=False  # Don't recreate attributes
+        r = await loop.run_in_executor(
+            None, lambda: requests.post(body.nefUrl, json=nef_payload, timeout=5)
         )
+        r.raise_for_status()
+        nef_sub_id = r.json().get("subscriptionId")
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="NEF did not respond")
+    except requests.exceptions.ConnectionError:
+        raise HTTPException(status_code=502, detail="Cannot connect to NEF")
     except Exception as e:
-        logger.warning(f"Failed to update Policy registration after label change: {e}")
+        raise HTTPException(status_code=500, detail=f"NEF subscription failed: {e}")
 
-    return {"subscription_id": subscription_id, "label": label}
+    nf_registry.add(
+        notif_id=body.notifId,
+        snssai=body.snssai,
+        dnn=body.dnn,
+        events=body.events,
+        nef_sub_id=nef_sub_id,
+        nef_url=body.nefUrl,
+    )
+    logger.info(f"NEF subscription created: notifId={body.notifId} nefSubId={nef_sub_id}")
+    return {"notifId": body.notifId, "nefSubscriptionId": nef_sub_id}
 
-@app.delete("/subscriptions/{subscription_id}")
-async def unsubscrive_to_producer(subscription_id : str):
-    try:
-        url = subscription_registry.get_url(subscription_id)
-        if url[-1] == "/":
-            url = url[:-1]
-        response = requests.delete(f"{url}/{subscription_id}")
-        if response.status_code == 200:
-            subscription_registry.remove(subscription_id)
-            return {"subscription_id" : subscription_id}
-        else:
-            raise HTTPException(status_code=response.status_code, detail=response.text)     
-    except KeyError:
+
+@app.get("/nef/subscriptions")
+async def list_nef_subscriptions():
+    return {"subscriptions": nf_registry.all()}
+
+
+@app.delete("/nef/subscriptions/{notif_id}", status_code=204)
+async def delete_nef_subscription(notif_id: str):
+    sub = nf_registry.get(notif_id)
+    if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
-    except HTTPException:
-        raise
-    except:
-        raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.post("/receive")
-async def receive_data(request: Request):
-    """Receive a data packet (dict) and return only the required fields.
+    if sub.get("nef_sub_id") and sub.get("nef_url"):
+        try:
+            nef_base = sub["nef_url"].rstrip("/")
+            url = f"{nef_base}/{sub['nef_sub_id']}"
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, lambda: requests.delete(url, timeout=5))
+        except Exception as e:
+            logger.warning(f"Failed to unsubscribe from NEF: {e}")
 
-    For any REQUIRED_FIELDS key missing from the incoming packet, the
-    returned value will be None.
-    """
+    nf_registry.remove(notif_id)
+    return Response(status_code=204)
 
-    # Use the component_id as the source for policy checks when writing to Kafka
-    # The external client sending data is irrelevant - we (ingestion-service) are the source
-    source_id = POLICY_COMPONENT_ID
 
+@app.post("/nef/notify", status_code=204)
+async def nef_notify(request: Request):
+    """Receive a NefEventExposureNotif callback from the NEF (TS 29.591)."""
     payload = await request.json()
-    data = payload or {}
-    id = ""
+    notif_id = payload.get("notifId")
 
-    try:
-        id = data["subscription_id"]
-        subscription_registry.received_data(id)
-        if id not in subscription_registry.all_producers():
-            print(id, subscription_registry.all_producers())
-            logger.warning("Received data from unsubscribed producer")
-            raise HTTPException(status_code=403, detail="Not subscribed")
-    except KeyError:
-        logger.warning("Received unexpected data from producer")
-        raise HTTPException(status_code=400, detail="Bad request")
-    except HTTPException:
-        raise
+    if not notif_id:
+        raise HTTPException(status_code=400, detail="Missing notifId")
 
-    logger.info(f"DEBUG: receive_data called, keys: {list(data.keys()) if isinstance(data, dict) else 'not dict'}")
-    results = []
+    context = nf_registry.get(notif_id)
+    if not context:
+        raise HTTPException(status_code=403, detail="Unknown notifId")
 
-    # Producer sends a batch under analyticsData where each element contains analyticsMetadata with the measurements
-    if isinstance(data, dict) and "analyticsData" in data:
-        logger.info("DEBUG: Processing analyticsData batch")
-        analytics_list = data.get("analyticsData") or []
-        logger.info(f"DEBUG: analytics_list has {len(analytics_list)} entries")
-        for i, entry in enumerate(analytics_list):
-            meta = entry.get("analyticsMetadata", {}) if isinstance(entry, dict) else {}
+    context_tags: dict[str, Any] = {}
+    if snssai := context.get("snssai"):
+        if (sst := snssai.get("sst")) is not None:
+            context_tags["snssai_sst"] = sst
+        if sd := snssai.get("sd"):
+            context_tags["snssai_sd"] = sd
+    if context.get("dnn"):
+        context_tags["dnn"] = context["dnn"]
 
-            # ts = meta.get("timestamp") if meta.get("timestamp") is not None else entry.get("timestamp")
-            record = {**meta, "timestamp": entry.get("timestamp")}
-
-            # Track all fields for policy field discovery
-            previous_field_count = len(_discovered_fields)
-            _discovered_fields.update(record.keys())
-
-            # Debug logging - log every time to see what's happening
-            logger.info(f"Field discovery: previous={previous_field_count}, current={len(_discovered_fields)}, record_keys={len(record.keys())}")
-
-            # Debug logging - use logger instead of print
-            if previous_field_count == 0:
-                logger.info(f"First data received! Discovered {len(_discovered_fields)} fields: {list(_discovered_fields)}")
-
-            # If new fields were discovered, re-register with Policy Service
-            if len(_discovered_fields) > previous_field_count:
-                logger.info(f"New fields discovered! Total: {len(_discovered_fields)}. Re-registering...")
-                try:
-                    await policy_client.register_component(
-                        component_type="ingestion",
-                        role=os.getenv("POLICY_ROLENAME", "Ingestion"),
-                        data_columns=list(_discovered_fields),
-                        allowed_fields=build_allowed_fields(),  # Update producer categories
-                        auto_create_attributes=True
-                    )
-                    logger.info(f"Updated component registration with {len(_discovered_fields)} fields")
-                except Exception as e:
-                    logger.warning(f"Failed to update component registration: {e}")
-
-            missing = REQUIRED_FIELDS - record.keys()
-            if missing or any(record.get(f) is None for f in REQUIRED_FIELDS):
-                results.append(
-                    {
-                        "status": "error",
-                        "message": f"Missing mandatory fields: {missing or REQUIRED_FIELDS}",
-                    }
-                )
-                continue
-
-            raw_data_store.append(record)  # Raw data stored
-
-            if kafka_bridge is None:
-                results.append({"status": "no-kafka", "data": record})
-                continue
-
-            result = await policy_client.process_data(
-                source_id=source_id,
-                sink_id="kafka",
-                data=record,
-                action="write"
-            )
-
-            if not result.allowed:
-                logger.warning(f"Data filtered by policy: {result.reason}")
-                continue
-
-            results.append({"status": "ok", "data": result.data})
-
-        # Send the whole batch as a single Kafka message
-        batch = [r["data"] for r in results if r["status"] == "ok"]
-        if batch and kafka_bridge is not None:
-            message = json.dumps(batch)
-            try:
-                ok = kafka_bridge.produce(TOPIC, message)
-            except Exception:
-                ok = False
-
-            if ok:
-                logger.info(f"Produced batch of {len(batch)} records to Kafka")
-                for record in batch:
-                    asyncio.create_task(
-                        manager.broadcast(id, {"type": "data_ingested", "data": record})
-                    )
+    records = []
+    for event_notif in payload.get("eventNotifs") or []:
+        event = event_notif.get("event")
+        normalizer_info = _EVENT_NORMALIZERS.get(event)
+        if not normalizer_info:
+            logger.warning(f"Unsupported event type: {event}")
+            continue
+        field_name, normalizer = normalizer_info
+        for info in event_notif.get(field_name) or []:
+            rec = normalizer(info, context_tags)
+            if rec:
+                records.append(rec)
             else:
-                logger.error(f"Failed to produce batch of {len(batch)} records")
-                results = [{"status": "error", "message": "Failed to send batch to Kafka"}]
+                logger.warning(f"Dropped {event} record: no UE identifier")
 
-        return {"results": results}
+    if not records:
+        return Response(status_code=204)
 
-    # Fallback
-    missing = REQUIRED_FIELDS - data.keys()
-    if missing or any(data.get(f) is None for f in REQUIRED_FIELDS):
-        return {
-            "status": "error",
-            "message": f"Missing mandatory fields: {missing or REQUIRED_FIELDS}",
-        }
-    message = json.dumps(data)  # Send to Kafka if available
-    if kafka_bridge is None:
-        print("Kafka bridge not available - skipping produce")
-        return {"status": "no-kafka", "data": data}
+    # Update discovered metric fields for Policy registration
+    for rec in records:
+        _discovered_fields.update(rec.get("metrics", {}).keys())
 
-    try:
-        success = kafka_bridge.produce(TOPIC, message)
-    except Exception:
-        success = False
-
-    if success:
-        # Broadcast to WebSocket clients
-        asyncio.create_task(manager.broadcast(id,{"type": "data_ingested", "data": data}))
-        return {"status": "ok", "data": data}
+    if policy_client is not None:
+        results = await asyncio.gather(*(
+            policy_client.process_data(source_id=POLICY_COMPONENT_ID, sink_id="kafka", data=rec, action="write")
+            for rec in records
+        ))
+        allowed_records = []
+        for result in results:
+            if result.allowed:
+                allowed_records.append(result.data)
+            else:
+                logger.warning(f"Record filtered by policy: {result.reason}")
     else:
-        return {"status": "error", "message": "Failed to send to Kafka"}
+        allowed_records = records
+
+    if not allowed_records:
+        return Response(status_code=204)
+
+    logger.info(f"[NEF RECORDS]\n{json.dumps(allowed_records, indent=2)}")
+
+    if kafka_bridge is not None:
+        message = json.dumps(allowed_records)
+        try:
+            ok = kafka_bridge.produce(TOPIC, message)
+        except Exception:
+            ok = False
+
+        if ok:
+            logger.info(f"NEF: produced {len(allowed_records)} records (notifId={notif_id})")
+            for rec in allowed_records:
+                asyncio.create_task(manager.broadcast(notif_id, {"type": "data_ingested", "data": rec}))
+        else:
+            logger.error(f"NEF: failed to produce {len(allowed_records)} records")
+    else:
+        logger.warning("NEF: Kafka bridge not available, skipping produce")
+
+    return Response(status_code=204)
 
 
-@app.websocket("/ws/ingestion/{subscription_id}")
-async def websocket_ingestion(websocket: WebSocket, subscription_id : str):
-    """
-    WebSocket endpoint for real-time data ingestion updates.
-
-    Clients connect to this endpoint to receive live updates when data is ingested.
-
-    Message format:
-    - {"type": "data_ingested", "data": {...}}
-    """
-    await manager.connect(websocket, subscription_id)
-
+@app.websocket("/ws/ingestion/{notif_id}")
+async def websocket_ingestion(websocket: WebSocket, notif_id: str):
+    """Real-time stream of ingested NEF events for a given notifId."""
+    await manager.connect(websocket, notif_id)
     try:
         while True:
-            # Keep connection alive and listen for client messages
             data = await websocket.receive_text()
-
-            # Handle ping/pong
             try:
-                message = json.loads(data)
-                if message.get("type") == "ping":
+                msg = json.loads(data)
+                if msg.get("type") == "ping":
                     await websocket.send_json({"type": "pong"})
             except json.JSONDecodeError:
-                logger.warning(f"Invalid JSON received: {data}")
-
+                pass
     except WebSocketDisconnect:
         await manager.disconnect(websocket)
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         await manager.disconnect(websocket)
-
-
-
