@@ -404,7 +404,7 @@ async def nef_notify(request: Request):
     if not allowed_records:
         return Response(status_code=204)
 
-    logger.info(f"[NEF RECORDS]\n{json.dumps(allowed_records, indent=2)}")
+    #logger.info(f"[NEF RECORDS]\n{json.dumps(allowed_records, indent=2)}")
 
     if kafka_bridge is not None:
         message = json.dumps(allowed_records)
