@@ -35,18 +35,24 @@ PORT = int(os.getenv("PORT", "7000"))
 
 REGISTRY_DB = os.getenv("REGISTRY_DB", "registry.db")
 
-# Tracks metric field names discovered from incoming NEF data (for Policy registration)
+_KNOWN_TAG_FIELDS: list[str] = [
+    "snssai_sst", "snssai_sd", "dnn",
+    "ueIpv4Addr", "ueIpv6Addr", "appId",
+    "supi", "gpsi", "interGroupId",
+]
+
+# Metric field names discovered from incoming NEF data
 _discovered_fields: set[str] = set()
 
 
-def get_discovered_fields() -> list[str]:
-    return list(_discovered_fields)
+def get_policy_columns() -> list[str]:
+    return _KNOWN_TAG_FIELDS + sorted(_discovered_fields)
 
 
 policy_client = PolicyClient(
     service_url=POLICY_SERVICE_URL,
     component_id=POLICY_COMPONENT_ID,
-    fields=get_discovered_fields,
+    fields=get_policy_columns,
     enable_policy=True,
     heartbeat_interval=30,
 ) if POLICY_ENABLED else None
@@ -245,7 +251,7 @@ async def lifespan(app: FastAPI):
             await policy_client.register_component(
                 component_type="ingestion",
                 role=os.getenv("POLICY_ROLENAME", "Ingestion"),
-                data_columns=list(_discovered_fields) or ["timestamp", "tags", "event", "metrics"],
+                data_columns=get_policy_columns(),
                 allowed_fields={},
                 auto_create_attributes=True,
             )
@@ -389,15 +395,26 @@ async def nef_notify(request: Request):
 
     if policy_client is not None:
         results = await asyncio.gather(*(
-            policy_client.process_data(source_id=POLICY_COMPONENT_ID, sink_id="kafka", data=rec, action="write")
+            policy_client.process_data(
+                source_id=POLICY_COMPONENT_ID,
+                sink_id="kafka",
+                data={**rec.get("tags", {}), **rec.get("metrics", {})},
+                action="write",
+            )
             for rec in records
         ))
         allowed_records = []
-        for result in results:
-            if result.allowed:
-                allowed_records.append(result.data)
-            else:
+        for rec, result in zip(records, results):
+            if not result.allowed:
                 logger.warning(f"Record filtered by policy: {result.reason}")
+                continue
+            tag_keys = rec.get("tags", {}).keys()
+            metric_keys = rec.get("metrics", {}).keys()
+            allowed_records.append({
+                **rec,
+                "tags": {k: result.data[k] for k in tag_keys if k in result.data},
+                "metrics": {k: result.data[k] for k in metric_keys if k in result.data},
+            })
     else:
         allowed_records = records
 
