@@ -1,15 +1,17 @@
-import pytest
-from fastapi.testclient import TestClient
-from unittest.mock import MagicMock, patch, AsyncMock, Mock
 import json
+import pytest
 import requests
+from fastapi.testclient import TestClient
+from unittest.mock import MagicMock, AsyncMock, Mock, patch
 
+from receiver import parse_bitrate_mbps, parse_datetime_to_unix
 
-SUBSCRIPTION_ID = "random_id"
+NOTIF_ID = "test-notif-001"
+
+# ── Fixtures ──────────────────────────────────────────────────────────────────
 
 @pytest.fixture
 def mock_kafka_bridge():
-    """Mock the PyKafBridge for testing."""
     mock = MagicMock()
     mock.produce = MagicMock(return_value=True)
     mock.close = AsyncMock()
@@ -17,595 +19,466 @@ def mock_kafka_bridge():
 
 
 @pytest.fixture
-def mock_subscription_registry():
-    """Mock the SubscriptionRegistry for testing."""
+def mock_nf_registry():
     mock = MagicMock()
     mock.add = MagicMock()
-    mock.remove = MagicMock()
-    mock.all_producers = MagicMock(return_value={})
-    mock.get_url = MagicMock()
-    mock.received_data = MagicMock()
+    mock.remove = MagicMock(return_value=True)
+    mock.all = MagicMock(return_value=[])
+    mock.get = MagicMock(return_value=None)
     return mock
 
 
 @pytest.fixture
-def client(mock_kafka_bridge, mock_subscription_registry):
-    """Create a test client with mocked Kafka bridge and subscription registry."""
+def client(mock_kafka_bridge, mock_nf_registry):
     with patch("receiver.PyKafBridge", return_value=mock_kafka_bridge), \
-         patch("receiver.subscription_registry", mock_subscription_registry), \
-         patch("receiver.check_producers_thread") as mock_thread:
-        mock_thread.start = MagicMock()
+         patch("receiver.nf_registry", mock_nf_registry):
         from receiver import app
-
-        with TestClient(app) as test_client:
-            yield test_client
-
-
-class TestReceiveEndpoint:
-    """Tests for the /receive endpoint."""
-
-    def test_receive_batch_data_success(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test receiving batch data with analyticsData structure."""
-        mock_subscription_registry.all_producers.return_value = {SUBSCRIPTION_ID: "http://producer:8000"}
-        
-        payload = {
-            "subscription_id" : SUBSCRIPTION_ID,
-            "analyticsData": [
-                {
-                    "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {
-                        "datarate": 100.5,
-                        "mean_latency": 20.3,
-                        "rsrp": -80,
-                        "sinr": 15.5,
-                        "rsrq": -10,
-                        "direction": "downlink",
-                        "network": "5G",
-                        "cqi": 12,
-                        "cell_index": 1,
-                        "primary_bandwidth": 100,
-                        "ul_bandwidth": 50,
-                        "latitude": 40.7128,
-                        "longitude": -74.0060,
-                        "altitude": 10.5,
-                        "velocity": 5.0,
-                    },
-                }
-            ]
-        }
-
-        response = client.post("/receive", json=payload)
-
-        assert response.status_code == 200
-        data = response.json()
-        assert "results" in data
-        assert len(data["results"]) == 1
-        assert data["results"][0]["status"] == "ok"
-        assert data["results"][0]["data"]["timestamp"] == "2024-01-01T12:00:00Z"
-        assert data["results"][0]["data"]["datarate"] == 100.5
-
-        # Verify Kafka produce was called
-        mock_kafka_bridge.produce.assert_called()
-
-    def test_receive_batch_data_multiple_entries(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test receiving multiple entries in analyticsData."""
-        mock_subscription_registry.all_producers.return_value = {SUBSCRIPTION_ID: "http://producer:8000"}
-        
-        payload = {
-            "subscription_id": SUBSCRIPTION_ID,
-            "analyticsData": [
-                {
-                    "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {
-                        "datarate": 100.5,
-                        "rsrp": -80,
-                        "cell_index": 1,
-                    },
-                },
-                {
-                    "timestamp": "2024-01-01T12:00:01Z",
-                    "analyticsMetadata": {
-                        "datarate": 105.2,
-                        "rsrp": -78,
-                        "cell_index": 1,
-                    },
-                },
-            ]
-        }
-
-        response = client.post("/receive", json=payload)
-
-        assert response.status_code == 200
-        data = response.json()
-        assert len(data["results"]) == 2
-        assert all(result["status"] == "ok" for result in data["results"])
-
-        # Verify Kafka produce was called once with the whole batch
-        mock_kafka_bridge.produce.assert_called_once()
-        call_args = mock_kafka_bridge.produce.call_args[0]
-        batch = json.loads(call_args[1])
-        assert isinstance(batch, list)
-        assert len(batch) == 2
-
-    def test_receive_fallback_single_packet(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test fallback case when data doesn't have analyticsData structure."""
-        mock_subscription_registry.all_producers.return_value = {SUBSCRIPTION_ID: "http://producer:8000"}
-        
-        payload = {
-            "subscription_id": SUBSCRIPTION_ID,
-            "timestamp": "2024-01-01T12:00:00Z",
-            "datarate": 100.5,
-            "mean_latency": 20.3,
-            "rsrp": -80,
-            "cell_index": 1,
-        }
-
-        response = client.post("/receive", json=payload)
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["status"] == "ok"
-        assert "data" in data
-        assert data["data"]["timestamp"] == "2024-01-01T12:00:00Z"
-        assert data["data"]["datarate"] == 100.5
-
-    def test_receive_missing_mandatory_fields(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test that missing cell_index or timestamp returns error."""
-        mock_subscription_registry.all_producers.return_value = {SUBSCRIPTION_ID: "http://producer:8000"}
-        
-        payload = {
-            "subscription_id": SUBSCRIPTION_ID,
-            "analyticsData": [
-                {
-                    "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {
-                        "datarate": 100.5
-                        # cell_index missing
-                    },
-                }
-            ]
-        }
-
-        response = client.post("/receive", json=payload)
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["results"][0]["status"] == "error"
-        assert "cell_index" in data["results"][0]["message"]
-
-    def test_receive_kafka_produce_failure(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test handling of Kafka produce failure."""
-        mock_subscription_registry.all_producers.return_value = {SUBSCRIPTION_ID: "http://producer:8000"}
-        mock_kafka_bridge.produce.return_value = False
-
-        payload = {
-            "subscription_id": SUBSCRIPTION_ID,
-            "analyticsData": [
-                {
-                    "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {"datarate": 100.5, "cell_index": 1},
-                }
-            ]
-        }
-
-        response = client.post("/receive", json=payload)
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["results"][0]["status"] == "error"
-        assert "Failed to send batch to Kafka" in data["results"][0]["message"]
-
-    def test_receive_kafka_produce_exception(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test handling of Kafka produce exception."""
-        mock_subscription_registry.all_producers.return_value = {SUBSCRIPTION_ID: "http://producer:8000"}
-        mock_kafka_bridge.produce.side_effect = Exception("Kafka connection error")
-
-        payload = {
-            "subscription_id": SUBSCRIPTION_ID,
-            "analyticsData": [
-                {
-                    "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {"datarate": 100.5, "cell_index": 1},
-                }
-            ]
-        }
-
-        response = client.post("/receive", json=payload)
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["results"][0]["status"] == "error"
-
-    def test_receive_no_kafka_bridge(self, client, mock_subscription_registry):
-        """Test behavior when Kafka bridge is not available."""
-        mock_subscription_registry.all_producers.return_value = {SUBSCRIPTION_ID: "http://producer:8000"}
-        
-        with patch("receiver.kafka_bridge", None):
-            payload = {
-                "subscription_id": SUBSCRIPTION_ID,
-                "analyticsData": [
-                    {
-                        "timestamp": "2024-01-01T12:00:00Z",
-                        "analyticsMetadata": {"datarate": 100.5, "cell_index": 1},
-                    }
-                ]
-            }
-
-            response = client.post("/receive", json=payload)
-
-            assert response.status_code == 200
-            data = response.json()
-            assert data["results"][0]["status"] == "no-kafka"
-
-    def test_receive_empty_analytics_data(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test receiving empty analyticsData array."""
-        mock_subscription_registry.all_producers.return_value = {SUBSCRIPTION_ID: "http://producer:8000"}
-        
-        payload = {
-            "subscription_id": SUBSCRIPTION_ID,
-            "analyticsData": []
-        }
-
-        response = client.post("/receive", json=payload)
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["results"] == []
-
-    def test_receive_all_fields_passthrough(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test that all fields are passed through without filtering."""
-        mock_subscription_registry.all_producers.return_value = {SUBSCRIPTION_ID: "http://producer:8000"}
-        
-        from receiver import REQUIRED_FIELDS
-
-        # Create complete metadata with various fields
-        metadata = {
-            "datarate": 100.5,
-            "mean_latency": 20.3,
-            "rsrp": -80,
-            "sinr": 15.5,
-            "rsrq": -10,
-            "direction": "downlink",
-            "network": "5G",
-            "cqi": 12,
-            "cell_index": 1,
-            "primary_bandwidth": 100,
-            "ul_bandwidth": 50,
-            "latitude": 40.7128,
-            "longitude": -74.0060,
-            "altitude": 10.5,
-            "velocity": 5.0,
-            "custom_field": "custom_value",  # Extra field
-        }
-
-        payload = {
-            "subscription_id": SUBSCRIPTION_ID,
-            "analyticsData": [
-                {"timestamp": "2024-01-01T12:00:00Z", "analyticsMetadata": metadata}
-            ]
-        }
-
-        response = client.post("/receive", json=payload)
-
-        assert response.status_code == 200
-        data = response.json()
-        result_data = data["results"][0]["data"]
-
-        # Verify required fields are present
-        for field in REQUIRED_FIELDS:
-            assert field in result_data
-
-        # Verify custom field is also present (passthrough)
-        assert "custom_field" in result_data
-        assert result_data["custom_field"] == "custom_value"
-
-    def test_kafka_message_format(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test that the Kafka message is properly JSON formatted."""
-        mock_subscription_registry.all_producers.return_value = {SUBSCRIPTION_ID: "http://producer:8000"}
-        
-        from receiver import TOPIC
-
-        payload = {
-            "subscription_id": SUBSCRIPTION_ID,
-            "analyticsData": [
-                {
-                    "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {
-                        "datarate": 100.5,
-                        "rsrp": -80,
-                        "cell_index": 1,
-                    },
-                }
-            ]
-        }
-
-        response = client.post("/receive", json=payload)
-
-        assert response.status_code == 200
-
-        # Verify the message sent to Kafka is valid JSON
-        call_args = mock_kafka_bridge.produce.call_args
-        topic_arg, message_arg = call_args[0]
-
-        assert topic_arg == TOPIC
-        # Verify it's valid JSON - now a batch (list of records)
-        parsed_message = json.loads(message_arg)
-        assert isinstance(parsed_message, list)
-        assert len(parsed_message) == 1
-        assert "timestamp" in parsed_message[0]
-        assert "datarate" in parsed_message[0]
-        assert "cell_index" in parsed_message[0]
+        with TestClient(app) as c:
+            yield c
 
 
-class TestSubscriptionEndpoints:
-    """Tests for subscription management endpoints."""
+@pytest.fixture
+def client_with_sub(mock_kafka_bridge, mock_nf_registry):
+    """Client where notifId is already registered with snssai+dnn context."""
+    mock_nf_registry.get.return_value = {
+        "notif_id": NOTIF_ID,
+        "snssai": {"sst": 1, "sd": "000001"},
+        "dnn": "internet",
+        "events": ["PERF_DATA", "UE_MOBILITY"],
+        "nef_sub_id": "nef-sub-abc",
+        "nef_url": "http://nef:8090/nnef-event-exposure/v1/subscriptions",
+        "created_at": 1000000,
+    }
+    with patch("receiver.PyKafBridge", return_value=mock_kafka_bridge), \
+         patch("receiver.nf_registry", mock_nf_registry):
+        from receiver import app
+        with TestClient(app) as c:
+            yield c
 
+
+# ── Parser unit tests ─────────────────────────────────────────────────────────
+
+class TestParseBitrateMbps:
+    def test_mbps(self):
+        assert parse_bitrate_mbps("48.57 Mbps") == pytest.approx(48.57)
+
+    def test_gbps(self):
+        assert parse_bitrate_mbps("10 Gbps") == pytest.approx(10000.0)
+
+    def test_kbps(self):
+        assert parse_bitrate_mbps("500 Kbps") == pytest.approx(0.5)
+
+    def test_bps(self):
+        assert parse_bitrate_mbps("1000000 bps") == pytest.approx(1.0)
+
+    def test_tbps(self):
+        assert parse_bitrate_mbps("1 Tbps") == pytest.approx(1e6)
+
+    def test_invalid(self):
+        assert parse_bitrate_mbps("not a bitrate") is None
+
+    def test_missing_unit(self):
+        assert parse_bitrate_mbps("100") is None
+
+
+class TestParseDatetimeToUnix:
+    def test_utc_z(self):
+        result = parse_datetime_to_unix("2026-04-20T10:15:00Z")
+        assert result == 1776680100
+
+    def test_utc_offset(self):
+        result = parse_datetime_to_unix("2026-04-20T10:15:00+00:00")
+        assert result == 1776680100
+
+    def test_non_utc_offset(self):
+        # +02:00 offset → same instant as 08:15:00Z
+        result = parse_datetime_to_unix("2026-04-20T10:15:00+02:00")
+        assert result == 1776672900
+
+    def test_invalid(self):
+        assert parse_datetime_to_unix("not a date") is None
+
+    def test_empty(self):
+        assert parse_datetime_to_unix("") is None
+
+
+# ── POST /nef/subscriptions ───────────────────────────────────────────────────
+
+class TestCreateNefSubscription:
     @patch("receiver.requests.post")
-    def test_subscribe_to_producer_success(self, mock_requests_post, client, mock_subscription_registry):
-        """Test successfully subscribing to a producer."""
-        # Mock the response from the producer
-        mock_response = Mock()
-        mock_response.text = json.dumps({"subscription_id": "test-sub-123"})
-        mock_response.status_code = 200
-        mock_requests_post.return_value = mock_response
+    def test_success(self, mock_post, client, mock_nf_registry):
+        mock_resp = Mock()
+        mock_resp.json.return_value = {"subscriptionId": "nef-sub-123"}
+        mock_resp.raise_for_status = Mock()
+        mock_post.return_value = mock_resp
 
-        producer_url = "http://producer-service:8000/subscribe"
-        payload = {"producer_url": producer_url}
+        response = client.post("/nef/subscriptions", json={
+            "notifId": NOTIF_ID,
+            "nefUrl": "http://nef:8090/nnef-event-exposure/v1/subscriptions",
+            "events": ["PERF_DATA", "UE_MOBILITY"],
+            "snssai": {"sst": 1, "sd": "000001"},
+            "dnn": "internet",
+        })
 
-        response = client.post("/subscriptions", json=payload)
-
-        # Verify the response
         assert response.status_code == 201
         data = response.json()
-        assert data["id"] == "test-sub-123"
-
-        # Verify requests.post was called correctly
-        from receiver import HOST, PORT
-        mock_requests_post.assert_called_once_with(
-            producer_url,
-            json={"url": f"http://{HOST}:{PORT}/receive"},
-            timeout=5
-        )
-
-        # Verify subscription was added to registry
-        mock_subscription_registry.add.assert_called_once_with("test-sub-123", producer_url)
+        assert data["notifId"] == NOTIF_ID
+        assert data["nefSubscriptionId"] == "nef-sub-123"
+        mock_nf_registry.add.assert_called_once()
 
     @patch("receiver.requests.post")
-    def test_subscribe_to_producer_timeout(self, mock_requests_post, client, mock_subscription_registry):
-        """Test subscribing when producer times out."""
-        mock_requests_post.side_effect = requests.exceptions.Timeout()
-
-        producer_url = "http://producer-service:8000/subscribe"
-        payload = {"producer_url": producer_url}
-
-        response = client.post("/subscriptions", json=payload)
-
+    def test_nef_timeout(self, mock_post, client, mock_nf_registry):
+        mock_post.side_effect = requests.exceptions.Timeout()
+        response = client.post("/nef/subscriptions", json={
+            "notifId": NOTIF_ID,
+            "nefUrl": "http://nef:8090/nnef-event-exposure/v1/subscriptions",
+            "events": ["PERF_DATA"],
+        })
         assert response.status_code == 504
-        assert "Producer didnt respond" in response.text
-
-        # Verify subscription was not added
-        mock_subscription_registry.add.assert_not_called()
+        mock_nf_registry.add.assert_not_called()
 
     @patch("receiver.requests.post")
-    def test_subscribe_to_producer_connection_error(self, mock_requests_post, client, mock_subscription_registry):
-        """Test subscribing when cannot connect to producer."""
-        mock_requests_post.side_effect = requests.exceptions.ConnectionError()
-
-        producer_url = "http://producer-service:8000/subscribe"
-        payload = {"producer_url": producer_url}
-
-        response = client.post("/subscriptions", json=payload)
-
+    def test_nef_connection_error(self, mock_post, client, mock_nf_registry):
+        mock_post.side_effect = requests.exceptions.ConnectionError()
+        response = client.post("/nef/subscriptions", json={
+            "notifId": NOTIF_ID,
+            "nefUrl": "http://nef:8090/nnef-event-exposure/v1/subscriptions",
+            "events": ["PERF_DATA"],
+        })
         assert response.status_code == 502
-        data = response.json()
-        assert "Cannot connect to producer" in data["detail"]
+        mock_nf_registry.add.assert_not_called()
 
-        # Verify subscription was not added
-        mock_subscription_registry.add.assert_not_called()
 
-    @patch("receiver.requests.post")
-    def test_subscribe_to_producer_unexpected_response(self, mock_requests_post, client, mock_subscription_registry):
-        """Test subscribing when producer gives unexpected response."""
-        mock_response = Mock()
-        mock_response.text = "invalid json"
-        mock_response.status_code = 200
-        mock_requests_post.return_value = mock_response
+# ── GET /nef/subscriptions ────────────────────────────────────────────────────
 
-        producer_url = "http://producer-service:8000/subscribe"
-        payload = {"producer_url": producer_url}
-
-        response = client.post("/subscriptions", json=payload)
-
-        assert response.status_code == 500
-        data = response.json()
-        assert "Producer gave unexpected answer" in data["detail"]
-
-        # Verify subscription was not added
-        mock_subscription_registry.add.assert_not_called()
-
-    def test_get_subscriptions_empty(self, client, mock_subscription_registry):
-        """Test getting subscriptions when none exist."""
-        mock_subscription_registry.all_producers.return_value = {}
-
-        response = client.get("/subscriptions")
-
+class TestListNefSubscriptions:
+    def test_empty(self, client, mock_nf_registry):
+        mock_nf_registry.all.return_value = []
+        response = client.get("/nef/subscriptions")
         assert response.status_code == 200
-        data = response.json()
-        assert "producers" in data
-        assert data["producers"] == []
+        assert response.json() == {"subscriptions": []}
 
-    def test_get_subscriptions_with_producers(self, client, mock_subscription_registry):
-        """Test getting subscriptions with existing producers."""
-        mock_subscription_registry.get_all_with_labels.return_value = {
-            "sub-1": {"url": "http://producer1:8000/subscribe", "label": "sub-1"},
-            "sub-2": {"url": "http://producer2:8000/subscribe", "label": "sub-2"},
-            "sub-3": {"url": "http://producer3:8000/subscribe", "label": "sub-3"},
+    def test_with_entries(self, client, mock_nf_registry):
+        mock_nf_registry.all.return_value = [
+            {"notif_id": "sub-1", "events": ["PERF_DATA"]},
+            {"notif_id": "sub-2", "events": ["UE_MOBILITY"]},
+        ]
+        response = client.get("/nef/subscriptions")
+        assert response.status_code == 200
+        assert len(response.json()["subscriptions"]) == 2
+
+
+# ── DELETE /nef/subscriptions/{notif_id} ─────────────────────────────────────
+
+class TestDeleteNefSubscription:
+    @patch("receiver.requests.delete")
+    def test_success(self, mock_delete, client, mock_nf_registry):
+        mock_nf_registry.get.return_value = {
+            "nef_sub_id": "nef-sub-abc",
+            "nef_url": "http://nef:8090/nnef-event-exposure/v1/subscriptions",
         }
+        mock_delete.return_value = Mock(status_code=204)
+        response = client.delete(f"/nef/subscriptions/{NOTIF_ID}")
+        assert response.status_code == 204
+        mock_nf_registry.remove.assert_called_once_with(NOTIF_ID)
 
-        response = client.get("/subscriptions")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert "producers" in data
-        assert len(data["producers"]) == 3
-        
-        # Verify format
-        producer_ids = [list(p.keys())[0] for p in data["producers"]]
-        assert "sub-1" in producer_ids
-        assert "sub-2" in producer_ids
-        assert "sub-3" in producer_ids
-
-    @patch("receiver.requests.delete")
-    def test_unsubscribe_success(self, mock_requests_delete, client, mock_subscription_registry):
-        """Test successfully unsubscribing from a producer."""
-        subscription_id = "test-sub-123"
-        producer_url = "http://producer-service:8000/subscribe"
-        
-        mock_subscription_registry.get_url.return_value = producer_url
-        
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_requests_delete.return_value = mock_response
-
-        response = client.delete(f"/subscriptions/{subscription_id}")
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["subscription_id"] == subscription_id
-
-        # Verify requests.delete was called correctly
-        mock_requests_delete.assert_called_once_with(f"{producer_url}/{subscription_id}")
-
-        # Verify subscription was removed from registry
-        mock_subscription_registry.remove.assert_called_once_with(subscription_id)
-
-    @patch("receiver.requests.delete")
-    def test_unsubscribe_with_trailing_slash(self, mock_requests_delete, client, mock_subscription_registry):
-        """Test unsubscribing when producer URL has trailing slash."""
-        subscription_id = "test-sub-123"
-        producer_url = "http://producer-service:8000/subscribe/"
-        
-        mock_subscription_registry.get_url.return_value = producer_url
-        
-        mock_response = Mock()
-        mock_response.status_code = 200
-        mock_requests_delete.return_value = mock_response
-
-        response = client.delete(f"/subscriptions/{subscription_id}")
-
-        assert response.status_code == 200
-
-        # Verify trailing slash was removed in the request
-        mock_requests_delete.assert_called_once_with(f"http://producer-service:8000/subscribe/{subscription_id}")
-
-    def test_unsubscribe_not_found(self, client, mock_subscription_registry):
-        """Test unsubscribing from non-existent subscription."""
-        subscription_id = "non-existent-sub"
-        mock_subscription_registry.get_url.side_effect = KeyError()
-
-        response = client.delete(f"/subscriptions/{subscription_id}")
-
+    def test_not_found(self, client, mock_nf_registry):
+        mock_nf_registry.get.return_value = None
+        response = client.delete(f"/nef/subscriptions/unknown-id")
         assert response.status_code == 404
-        data = response.json()
-        assert "Subscription not found" in data["detail"]
-
-    @patch("receiver.requests.delete")
-    def test_unsubscribe_producer_error(self, mock_requests_delete, client, mock_subscription_registry):
-        """Test unsubscribing when producer returns error."""
-        subscription_id = "test-sub-123"
-        producer_url = "http://producer-service:8000/subscribe"
-        
-        mock_subscription_registry.get_url.return_value = producer_url
-        
-        mock_response = Mock()
-        mock_response.status_code = 404
-        mock_response.text = "Subscription not found on producer"
-        mock_requests_delete.return_value = mock_response
-
-        response = client.delete(f"/subscriptions/{subscription_id}")
-
-        assert response.status_code == 404
-        data = response.json()
-        assert "Subscription not found on producer" in data["detail"]
-
-        # Verify subscription was not removed from registry
-        mock_subscription_registry.remove.assert_not_called()
 
 
-class TestReceiveWithSubscription:
-    """Tests for /receive endpoint with subscription validation."""
+# ── POST /nef/notify ─────────────────────────────────────────────────────────
 
-    def test_receive_data_from_subscribed_producer(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test receiving data from a subscribed producer."""
-        subscription_id = "test-sub-123"
-        mock_subscription_registry.all_producers.return_value = {subscription_id: "http://producer:8000"}
-
-        payload = {
-            "subscription_id": subscription_id,
-            "analyticsData": [
-                {
-                    "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {
-                        "datarate": 100.5,
-                        "cell_index": 1,
-                    },
-                }
-            ]
-        }
-
-        response = client.post("/receive", json=payload)
-
-        assert response.status_code == 200
-        data = response.json()
-        assert data["results"][0]["status"] == "ok"
-
-        # Verify received_data was called
-        mock_subscription_registry.received_data.assert_called_once_with(subscription_id)
-
-    def test_receive_data_from_unsubscribed_producer(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test receiving data from an unsubscribed producer."""
-        subscription_id = "unsubscribed-id"
-        mock_subscription_registry.all_producers.return_value = {}
-
-        payload = {
-            "subscription_id": subscription_id,
-            "analyticsData": [
-                {
-                    "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {
-                        "datarate": 100.5,
-                        "cell_index": 1,
-                    },
-                }
-            ]
-        }
-
-        response = client.post("/receive", json=payload)
-
-        assert response.status_code == 403
-        assert "Not subscribed" in response.text
-
-        # Verify received_data was still called (before checking subscription)
-        mock_subscription_registry.received_data.assert_called_once_with(subscription_id)
-
-    def test_receive_data_without_subscription_id(self, client, mock_kafka_bridge, mock_subscription_registry):
-        """Test receiving data without subscription_id field."""
-        payload = {
-            "analyticsData": [
-                {
-                    "timestamp": "2024-01-01T12:00:00Z",
-                    "analyticsMetadata": {
-                        "datarate": 100.5,
-                        "cell_index": 1,
-                    },
-                }
-            ]
-        }
-
-        response = client.post("/receive", json=payload)
-
+class TestNefNotify:
+    def test_missing_notif_id(self, client):
+        response = client.post("/nef/notify", json={"eventNotifs": []})
         assert response.status_code == 400
-        assert "Bad request" in response.text
 
-        # Verify received_data was not called
-        mock_subscription_registry.received_data.assert_not_called()
+    def test_unknown_notif_id(self, client, mock_nf_registry):
+        mock_nf_registry.get.return_value = None
+        response = client.post("/nef/notify", json={"notifId": "unknown", "eventNotifs": []})
+        assert response.status_code == 403
+
+    def test_perf_data_event(self, client_with_sub, mock_kafka_bridge):
+        payload = {
+            "notifId": NOTIF_ID,
+            "eventNotifs": [{
+                "event": "PERF_DATA",
+                "timeStamp": "2026-04-20T10:15:00Z",
+                "perfDataInfos": [{
+                    "ueIpAddr": {"ipv4Addr": "10.0.1.10"},
+                    "appId": "app-test",
+                    "timeStamp": "2026-04-20T10:15:00Z",
+                    "perfData": {
+                        "thrputUl": "11.74 Mbps",
+                        "thrputDl": "87.57 Mbps",
+                        "pdb": 18,
+                        "plr": 17,
+                    },
+                }],
+            }],
+        }
+        response = client_with_sub.post("/nef/notify", json=payload)
+        assert response.status_code == 204
+        mock_kafka_bridge.produce.assert_called_once()
+
+        batch = json.loads(mock_kafka_bridge.produce.call_args[0][1])
+        assert isinstance(batch, list)
+        rec = batch[0]
+        assert rec["event"] == "PERF_DATA"
+        assert rec["tags"]["ueIpv4Addr"] == "10.0.1.10"
+        assert rec["tags"]["snssai_sst"] == 1
+        assert rec["tags"]["snssai_sd"] == "000001"
+        assert rec["tags"]["dnn"] == "internet"
+        assert rec["metrics"]["thrputUl_mbps"] == pytest.approx(11.74)
+        assert rec["metrics"]["thrputDl_mbps"] == pytest.approx(87.57)
+        assert rec["metrics"]["pdb_ms"] == 18
+        assert rec["metrics"]["plr_per_thousand"] == 17
+
+    def test_ue_mobility_event(self, client_with_sub, mock_kafka_bridge):
+        payload = {
+            "notifId": NOTIF_ID,
+            "eventNotifs": [{
+                "event": "UE_MOBILITY",
+                "timeStamp": "2026-04-20T10:15:00Z",
+                "ueMobilityInfos": [{
+                    "supi": "imsi-001011234567890",
+                    "ueTrajs": [
+                        {
+                            "ts": "2026-04-20T10:14:50Z",
+                            "location": {"nrLocation": {
+                                "tai": {"plmnId": {"mcc": "001", "mnc": "01"}, "tac": "000001"},
+                                "ncgi": {"plmnId": {"mcc": "001", "mnc": "01"}, "nrCellId": "000000001"},
+                            }},
+                        },
+                        {
+                            "ts": "2026-04-20T10:15:00Z",
+                            "location": {"nrLocation": {
+                                "tai": {"plmnId": {"mcc": "001", "mnc": "01"}, "tac": "000002"},
+                                "ncgi": {"plmnId": {"mcc": "001", "mnc": "01"}, "nrCellId": "000000002"},
+                            }},
+                        },
+                    ],
+                }],
+            }],
+        }
+        response = client_with_sub.post("/nef/notify", json=payload)
+        assert response.status_code == 204
+        mock_kafka_bridge.produce.assert_called_once()
+
+        batch = json.loads(mock_kafka_bridge.produce.call_args[0][1])
+        rec = batch[0]
+        assert rec["event"] == "UE_MOBILITY"
+        assert rec["tags"]["supi"] == "imsi-001011234567890"
+        assert len(rec["metrics"]["trajectory"]) == 2
+        assert rec["metrics"]["trajectory"][0]["tac"] == "000001"
+        assert rec["metrics"]["trajectory"][1]["nrCellId"] == "000000002"
+
+    def test_ue_comm_event(self, client_with_sub, mock_kafka_bridge):
+        payload = {
+            "notifId": NOTIF_ID,
+            "eventNotifs": [{
+                "event": "UE_COMM",
+                "timeStamp": "2026-04-20T10:15:00Z",
+                "ueCommInfos": [{
+                    "supi": "imsi-001011234567890",
+                    "comms": [{
+                        "startTime": "2026-04-20T10:00:00Z",
+                        "endTime": "2026-04-20T10:15:00Z",
+                        "ulVol": 1048576,
+                        "dlVol": 52428800,
+                    }],
+                }],
+            }],
+        }
+        response = client_with_sub.post("/nef/notify", json=payload)
+        assert response.status_code == 204
+        mock_kafka_bridge.produce.assert_called_once()
+
+        batch = json.loads(mock_kafka_bridge.produce.call_args[0][1])
+        rec = batch[0]
+        assert rec["event"] == "UE_COMM"
+        assert rec["tags"]["supi"] == "imsi-001011234567890"
+        assert rec["metrics"]["comms"][0]["ulVol"] == 1048576
+        assert rec["metrics"]["comms"][0]["dlVol"] == 52428800
+
+    def test_no_ue_identifier_drops_record(self, client_with_sub, mock_kafka_bridge):
+        """PERF_DATA without ueIpAddr and no context tags → record dropped."""
+        payload = {
+            "notifId": NOTIF_ID,
+            "eventNotifs": [{
+                "event": "PERF_DATA",
+                "timeStamp": "2026-04-20T10:15:00Z",
+                "perfDataInfos": [{
+                    "timeStamp": "2026-04-20T10:15:00Z",
+                    "perfData": {"pdb": 10},
+                }],
+            }],
+        }
+        # Override context to have no snssai/dnn so there are also no context tags
+        from receiver import nf_registry as reg
+        reg.get.return_value = {
+            "notif_id": NOTIF_ID,
+            "snssai": None,
+            "dnn": None,
+            "events": ["PERF_DATA"],
+            "nef_sub_id": None,
+            "nef_url": None,
+            "created_at": 1000000,
+        }
+        response = client_with_sub.post("/nef/notify", json=payload)
+        assert response.status_code == 204
+        mock_kafka_bridge.produce.assert_not_called()
+
+    def test_unsupported_event_type_skipped(self, client_with_sub, mock_kafka_bridge):
+        payload = {
+            "notifId": NOTIF_ID,
+            "eventNotifs": [{
+                "event": "DISPERSION",
+                "timeStamp": "2026-04-20T10:15:00Z",
+                "dispersionInfos": [],
+            }],
+        }
+        response = client_with_sub.post("/nef/notify", json=payload)
+        assert response.status_code == 204
+        mock_kafka_bridge.produce.assert_not_called()
+
+    def test_kafka_unavailable(self, client_with_sub, mock_kafka_bridge):
+        payload = {
+            "notifId": NOTIF_ID,
+            "eventNotifs": [{
+                "event": "PERF_DATA",
+                "timeStamp": "2026-04-20T10:15:00Z",
+                "perfDataInfos": [{
+                    "ueIpAddr": {"ipv4Addr": "10.0.1.10"},
+                    "timeStamp": "2026-04-20T10:15:00Z",
+                    "perfData": {"pdb": 10},
+                }],
+            }],
+        }
+        with patch("receiver.kafka_bridge", None):
+            response = client_with_sub.post("/nef/notify", json=payload)
+        assert response.status_code == 204
+        mock_kafka_bridge.produce.assert_not_called()
+
+    def test_multi_event_batch(self, client_with_sub, mock_kafka_bridge):
+        """Both PERF_DATA and UE_MOBILITY in one notification → single Kafka batch."""
+        payload = {
+            "notifId": NOTIF_ID,
+            "eventNotifs": [
+                {
+                    "event": "PERF_DATA",
+                    "timeStamp": "2026-04-20T10:15:00Z",
+                    "perfDataInfos": [{
+                        "ueIpAddr": {"ipv4Addr": "10.0.1.10"},
+                        "timeStamp": "2026-04-20T10:15:00Z",
+                        "perfData": {"thrputDl": "50 Mbps"},
+                    }],
+                },
+                {
+                    "event": "UE_MOBILITY",
+                    "timeStamp": "2026-04-20T10:15:00Z",
+                    "ueMobilityInfos": [{
+                        "supi": "imsi-001011234567890",
+                        "ueTrajs": [{"ts": "2026-04-20T10:15:00Z", "location": {}}],
+                    }],
+                },
+            ],
+        }
+        response = client_with_sub.post("/nef/notify", json=payload)
+        assert response.status_code == 204
+        mock_kafka_bridge.produce.assert_called_once()
+        batch = json.loads(mock_kafka_bridge.produce.call_args[0][1])
+        assert len(batch) == 2
+        events = {r["event"] for r in batch}
+        assert events == {"PERF_DATA", "UE_MOBILITY"}
+
+    def test_kafka_produce_returns_false(self, client_with_sub, mock_kafka_bridge):
+        """produce() returning False → no exception, 204 still returned."""
+        mock_kafka_bridge.produce.return_value = False
+        payload = {
+            "notifId": NOTIF_ID,
+            "eventNotifs": [{
+                "event": "PERF_DATA",
+                "timeStamp": "2026-04-20T10:15:00Z",
+                "perfDataInfos": [{
+                    "ueIpAddr": {"ipv4Addr": "10.0.1.10"},
+                    "timeStamp": "2026-04-20T10:15:00Z",
+                    "perfData": {"pdb": 10},
+                }],
+            }],
+        }
+        response = client_with_sub.post("/nef/notify", json=payload)
+        assert response.status_code == 204
+        mock_kafka_bridge.produce.assert_called_once()
+
+    def test_kafka_produce_raises(self, client_with_sub, mock_kafka_bridge):
+        """produce() raising → no exception, 204 still returned."""
+        mock_kafka_bridge.produce.side_effect = RuntimeError("broker down")
+        payload = {
+            "notifId": NOTIF_ID,
+            "eventNotifs": [{
+                "event": "PERF_DATA",
+                "timeStamp": "2026-04-20T10:15:00Z",
+                "perfDataInfos": [{
+                    "ueIpAddr": {"ipv4Addr": "10.0.1.10"},
+                    "timeStamp": "2026-04-20T10:15:00Z",
+                    "perfData": {"pdb": 10},
+                }],
+            }],
+        }
+        response = client_with_sub.post("/nef/notify", json=payload)
+        assert response.status_code == 204
+
+    def test_ue_mobility_empty_trajs(self, client_with_sub, mock_kafka_bridge):
+        """UE_MOBILITY with empty ueTrajs → record still produced with empty trajectory."""
+        payload = {
+            "notifId": NOTIF_ID,
+            "eventNotifs": [{
+                "event": "UE_MOBILITY",
+                "timeStamp": "2026-04-20T10:15:00Z",
+                "ueMobilityInfos": [{
+                    "supi": "imsi-001011234567890",
+                    "ueTrajs": [],
+                }],
+            }],
+        }
+        response = client_with_sub.post("/nef/notify", json=payload)
+        assert response.status_code == 204
+        mock_kafka_bridge.produce.assert_called_once()
+        batch = json.loads(mock_kafka_bridge.produce.call_args[0][1])
+        assert batch[0]["metrics"]["trajectory"] == []
+
+    def test_perf_data_context_tags_only(self, client_with_sub, mock_kafka_bridge):
+        """PERF_DATA without ueIpAddr but with snssai context → record produced."""
+        payload = {
+            "notifId": NOTIF_ID,
+            "eventNotifs": [{
+                "event": "PERF_DATA",
+                "timeStamp": "2026-04-20T10:15:00Z",
+                "perfDataInfos": [{
+                    "timeStamp": "2026-04-20T10:15:00Z",
+                    "perfData": {"pdb": 10},
+                }],
+            }],
+        }
+        response = client_with_sub.post("/nef/notify", json=payload)
+        assert response.status_code == 204
+        mock_kafka_bridge.produce.assert_called_once()
+        batch = json.loads(mock_kafka_bridge.produce.call_args[0][1])
+        rec = batch[0]
+        assert rec["tags"]["snssai_sst"] == 1
+        assert "ueIpv4Addr" not in rec["tags"]
+
+    @patch("receiver.requests.delete")
+    def test_delete_nef_call_fails_still_removes_local(self, mock_delete, client, mock_nf_registry):
+        """If the NEF DELETE call fails, the local subscription is still removed."""
+        mock_nf_registry.get.return_value = {
+            "nef_sub_id": "nef-sub-abc",
+            "nef_url": "http://nef:8090/nnef-event-exposure/v1/subscriptions",
+        }
+        mock_delete.side_effect = Exception("NEF unreachable")
+        response = client.delete(f"/nef/subscriptions/{NOTIF_ID}")
+        assert response.status_code == 204
+        mock_nf_registry.remove.assert_called_once_with(NOTIF_ID)

@@ -18,8 +18,14 @@ services:
       - HOST=${INGESTION_HOST:-data-ingestion}
       - PORT=7000
       - PRODUCER_MAX_TIMEOUT=30
+      - REGISTRY_DB=/data/registry.db
+    volumes:
+      - registry-data:/data
     networks:
       - nwdaf-network
+
+volumes:
+  registry-data:
 
 networks:
   nwdaf-network:

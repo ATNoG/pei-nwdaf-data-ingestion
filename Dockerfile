@@ -25,7 +25,7 @@ RUN mkdir utils && cd utils \
 # Copy dependency files
 COPY pyproject.toml uv.lock ./
 COPY receiver.py .
-COPY subscription_registry.py .
+COPY registry.py .
 
 # Install dependencies using uv
 RUN uv sync --no-install-project
