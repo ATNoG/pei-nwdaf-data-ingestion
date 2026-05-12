@@ -15,6 +15,7 @@ jobs:
           repository: ATNoG/pei-nwdaf
           token: ${{ secrets.PAT_TOKEN }}
           ref: dev
+          submodules: true
 
       - name: Update submodule
         run: |
