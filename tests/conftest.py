@@ -1,7 +1,8 @@
 """Pytest configuration and fixtures."""
 import sys
 from unittest.mock import MagicMock
-
+import os
+os.environ.setdefault("DEV_MODE", "true")
 
 # Mock the utils.kmw module before importing receiver
 class MockPyKafBridge:
