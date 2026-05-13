@@ -19,6 +19,9 @@ services:
       - PORT=7000
       - PRODUCER_MAX_TIMEOUT=30
       - REGISTRY_DB=/data/registry.db
+      - DEV_MODE=${DEV_MODE:-false}
+      - KEYCLOAK_URL=${KEYCLOAK_URL:-http://keycloak:8080/auth}
+      - KEYCLOAK_REALM=${KEYCLOAK_REALM:-aion}
     volumes:
       - registry-data:/data
     networks:
