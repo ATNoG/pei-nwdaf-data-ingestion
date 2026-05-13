@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any, Dict, Set
 
 import requests
+from auth_middleware import AuthMiddleware
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -270,6 +271,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+app.add_middleware(AuthMiddleware)
 origins = os.getenv("CORS_ORIGINS", "")
 allowed_origins = [o.strip() for o in origins.split(",") if o.strip()]
 app.add_middleware(

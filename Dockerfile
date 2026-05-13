@@ -26,6 +26,7 @@ RUN mkdir utils && cd utils \
 COPY pyproject.toml uv.lock ./
 COPY receiver.py .
 COPY registry.py .
+COPY auth_middleware.py .
 
 # Install dependencies using uv
 RUN uv sync --no-install-project
