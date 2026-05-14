@@ -392,8 +392,22 @@ async def nef_notify(request: Request):
         return Response(status_code=204)
 
     # Update discovered metric fields for Policy registration
+    prev_count = len(_discovered_fields)
     for rec in records:
         _discovered_fields.update(rec.get("metrics", {}).keys())
+
+    if policy_client is not None and len(_discovered_fields) > prev_count:
+        try:
+            await policy_client.register_component(
+                component_type="ingestion",
+                role=os.getenv("POLICY_ROLENAME", "Ingestion"),
+                data_columns=get_policy_columns(),
+                allowed_fields={},
+                auto_create_attributes=True,
+            )
+            logger.info(f"Re-registered with Policy Service ({len(_discovered_fields)} metric fields discovered)")
+        except Exception as e:
+            logger.warning(f"Failed to update Policy registration: {e}")
 
     if policy_client is not None:
         results = await asyncio.gather(*(
