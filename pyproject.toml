@@ -11,6 +11,7 @@ dependencies = [
     "confluent-kafka==2.12.2",
     "websockets==14.1",
     "requests>=2.32",
+    "PyJWT[crypto]>=2.8.0",
     "policy-client-sdk @ git+https://github.com/ATNoG/pei-nwdaf-policy.git#subdirectory=client_sdk",
 ]
 
