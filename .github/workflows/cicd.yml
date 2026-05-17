@@ -33,11 +33,11 @@ jobs:
 
       - name: Run security scan with bandit
         run: |
-          uv run bandit -r receiver.py -f txt || true
+          uvx bandit -r . --skip B101 -x ./.venv
 
-      - name: Run safety check
+      - name: Run pip-audit
         run: |
-          uv pip list --format=freeze | uv run safety check --stdin || true
+          uvx pip-audit
 
 #  trigger-jenkins:
 #    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
