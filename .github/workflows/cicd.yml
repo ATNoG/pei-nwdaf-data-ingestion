@@ -37,7 +37,8 @@ jobs:
 
       - name: Run pip-audit
         run: |
-          uvx pip-audit
+          uv export --no-emit-project --no-hashes --no-dev -o requirements-audit.txt
+          uvx pip-audit@latest -r requirements-audit.txt
 
 #  trigger-jenkins:
 #    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
