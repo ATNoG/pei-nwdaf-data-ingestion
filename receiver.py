@@ -426,10 +426,12 @@ async def nef_notify(request: Request):
                 continue
             tag_keys = rec.get("tags", {}).keys()
             metric_keys = rec.get("metrics", {}).keys()
+            fhe_meta = {k: result.data[k] for k in ("__fhe_context__", "__fhe_encrypted_fields__") if k in result.data}
             allowed_records.append({
                 **rec,
                 "tags": {k: result.data[k] for k in tag_keys if k in result.data},
                 "metrics": {k: result.data[k] for k in metric_keys if k in result.data},
+                **fhe_meta,
             })
     else:
         allowed_records = records
