@@ -35,11 +35,11 @@ jobs:
         run: |
           uvx bandit -r . --skip B101 -x ./.venv
 
-      - name: Run pip-audit
-        run: |
-          uv export --no-emit-project --no-hashes --no-dev -o requirements-audit.txt
-          uvx pip-audit@latest -r requirements-audit.txt
-
+      - name: Dependency vulnerability scan
+        uses: google/osv-scanner-action/osv-scanner-action@v2
+        with:
+          scan-args: |-
+            --lockfile=uv.lock
 #  trigger-jenkins:
 #    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 #    needs: test
