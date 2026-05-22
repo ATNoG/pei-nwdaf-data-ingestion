@@ -182,17 +182,23 @@ def _normalize_ue_comm(info: dict, context_tags: dict) -> dict | None:
         comms.append({
             "startTime": parse_datetime_to_unix(comm["startTime"]) if comm.get("startTime") else None,
             "endTime": parse_datetime_to_unix(comm["endTime"]) if comm.get("endTime") else None,
-            "ulVol": comm.get("ulVol"),
-            "dlVol": comm.get("dlVol"),
         })
 
     timestamp = comms[0]["endTime"] if comms and comms[0].get("endTime") else int(time.time())
+
+    metrics: dict[str, Any] = {}
+    if info.get("ulVol") is not None:
+        metrics["ulVol"] = int(info["ulVol"])
+    if info.get("dlVol") is not None:
+        metrics["dlVol"] = int(info["dlVol"])
+    if info.get("commDur") is not None:
+        metrics["commDur"] = int(info["commDur"])
 
     return {
         "timestamp": timestamp,
         "tags": tags,
         "event": "UE_COMM",
-        "metrics": {"comms": comms},
+        "metrics": metrics,
     }
 
 
