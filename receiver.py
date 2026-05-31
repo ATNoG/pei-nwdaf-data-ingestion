@@ -50,12 +50,14 @@ def get_policy_columns() -> list[str]:
     return _KNOWN_TAG_FIELDS + sorted(_discovered_fields)
 
 
+POLICY_HEARTBEAT_INTERVAL = int(os.getenv("POLICY_HEARTBEAT_INTERVAL", "30"))
+
 policy_client = PolicyClient(
     service_url=POLICY_SERVICE_URL,
     component_id=POLICY_COMPONENT_ID,
     fields=get_policy_columns,
     enable_policy=True,
-    heartbeat_interval=30,
+    heartbeat_interval=POLICY_HEARTBEAT_INTERVAL,
 ) if POLICY_ENABLED else None
 
 nf_registry = NfRegistry(db_path=REGISTRY_DB)
