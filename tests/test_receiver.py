@@ -276,6 +276,8 @@ class TestNefNotify:
         assert rec["metrics"]["trajectory"][1]["nrCellId"] == "000000002"
 
     def test_ue_comm_event(self, client_with_sub, mock_kafka_bridge):
+        # TS 29.591 UeCommunication: ulVol/dlVol/commDur are top-level scalars
+        # on the info entry; comms[] only carries per-period startTime/endTime.
         payload = {
             "notifId": NOTIF_ID,
             "eventNotifs": [{
@@ -283,11 +285,12 @@ class TestNefNotify:
                 "timeStamp": "2026-04-20T10:15:00Z",
                 "ueCommInfos": [{
                     "supi": "imsi-001011234567890",
+                    "ulVol": 1048576,
+                    "dlVol": 52428800,
+                    "commDur": 900,
                     "comms": [{
                         "startTime": "2026-04-20T10:00:00Z",
                         "endTime": "2026-04-20T10:15:00Z",
-                        "ulVol": 1048576,
-                        "dlVol": 52428800,
                     }],
                 }],
             }],
@@ -300,8 +303,9 @@ class TestNefNotify:
         rec = batch[0]
         assert rec["event"] == "UE_COMM"
         assert rec["tags"]["supi"] == "imsi-001011234567890"
-        assert rec["metrics"]["comms"][0]["ulVol"] == 1048576
-        assert rec["metrics"]["comms"][0]["dlVol"] == 52428800
+        assert rec["metrics"]["ulVol"] == 1048576
+        assert rec["metrics"]["dlVol"] == 52428800
+        assert rec["metrics"]["commDur"] == 900
 
     def test_no_ue_identifier_drops_record(self, client_with_sub, mock_kafka_bridge):
         """PERF_DATA without ueIpAddr and no context tags → record dropped."""
