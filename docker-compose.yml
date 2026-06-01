@@ -21,6 +21,7 @@ services:
       - REGISTRY_DB=/data/registry.db
       - DEV_MODE=${DEV_MODE:-false}
       - KEYCLOAK_URL=${KEYCLOAK_URL:-http://keycloak:8080/auth}
+      - POLICY_HEARTBEAT_INTERVAL=${POLICY_HEARTBEAT_INTERVAL:30}
       - KEYCLOAK_REALM=${KEYCLOAK_REALM:-aion}
     volumes:
       - registry-data:/data
